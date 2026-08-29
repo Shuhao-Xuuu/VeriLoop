@@ -3,6 +3,8 @@ from __future__ import annotations
 from types import SimpleNamespace
 from typing import Any
 
+import httpx
+import openai
 import pytest
 
 from veriloop.model import (
@@ -155,6 +157,48 @@ def test_three_retryable_failures_raise_retry_exhausted() -> None:
     assert caught.value.kind.value == "provider_retry_exhausted"
     assert len(client.completions.requests) == 3
     assert sleeps == [0.1, 0.2]
+
+
+def test_default_sdk_client_limits_total_http_requests_to_three(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    request_count = 0
+    created_clients: list[openai.OpenAI] = []
+    real_openai_client = openai.OpenAI
+
+    def fail_with_500(request: httpx.Request) -> httpx.Response:
+        nonlocal request_count
+        request_count += 1
+        return httpx.Response(
+            500,
+            request=request,
+            json={"error": {"message": "offline failure", "type": "server_error"}},
+        )
+
+    def build_offline_client(**kwargs: Any) -> openai.OpenAI:
+        kwargs["base_url"] = "https://offline.invalid/v1"
+        kwargs["http_client"] = httpx.Client(
+            transport=httpx.MockTransport(fail_with_500)
+        )
+        client = real_openai_client(**kwargs)
+        created_clients.append(client)
+        return client
+
+    monkeypatch.setattr(openai, "OpenAI", build_offline_client)
+    model = OpenAICompatibleModel(
+        model="offline-model",
+        api_key="offline-placeholder",
+        sleep=lambda _: None,
+        backoff_seconds=0,
+    )
+
+    try:
+        with pytest.raises(ProviderRetryExhaustedError):
+            model.complete([], [])
+    finally:
+        created_clients[0].close()
+
+    assert request_count == 3
 
 
 def test_fatal_provider_error_is_not_retried() -> None:

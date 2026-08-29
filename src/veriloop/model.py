@@ -61,7 +61,11 @@ class OpenAICompatibleModel:
         backoff_seconds: float = 0.25,
     ) -> None:
         if client is None:
-            client = openai.OpenAI(api_key=api_key, base_url=base_url)
+            client = openai.OpenAI(
+                api_key=api_key,
+                base_url=base_url,
+                max_retries=0,
+            )
         self._client = client
         self._model = model
         self._sleep = sleep

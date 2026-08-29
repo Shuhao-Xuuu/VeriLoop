@@ -128,7 +128,21 @@ class AgentLoop:
 
             state = AgentState.EXECUTING
             for call in response.tool_calls:
-                result = self._tools.execute(call)
+                try:
+                    result = self._tools.execute(call)
+                except KeyboardInterrupt:
+                    state = AgentState.CANCELLED
+                    return AgentResult(
+                        state=state,
+                        final_message="",
+                        step_count=step_count,
+                        tool_call_count=tool_call_count,
+                        history=tuple(history),
+                        error=AgentError(
+                            kind=ErrorKind.CANCELLED,
+                            message="agent run cancelled during tool execution",
+                        ),
+                    )
                 tool_call_count += 1
                 history.append(
                     Message(
