@@ -17,3 +17,11 @@
   the existing configured remote.
 - Never force-push, rewrite history, use destructive Git cleanup/reset commands,
   change remotes, or alter global Git/credential configuration.
+- Milestone 2 path, SHA, atomic-write, command-policy, timeout, output, and child
+  environment boundaries must not be weakened by later work.
+- Milestone 3 must continue to execute every tool through `ToolRegistry`; it may
+  not add direct file or subprocess access to `AgentLoop`.
+- The tool execution layer must never receive provider secrets. A prompt is not
+  a substitute for host-side path, command, or environment checks.
+- Do not amend, replace, or otherwise rewrite the reviewed Milestone 1 or
+  Milestone 2 commit history.

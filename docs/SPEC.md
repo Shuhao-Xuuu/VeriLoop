@@ -1,98 +1,171 @@
-# VeriLoop Milestone 1 specification
+# VeriLoop milestone specification
 
-## Scope
+## Milestone status
 
-Milestone 1 implements the minimum synchronous, provider-independent harness:
+Milestone 1 is complete and passed independent review. It established the
+provider-independent protocol, `ModelClient`, non-streaming OpenAI-compatible
+adapter, bounded provider retry, `ToolRegistry`, `ScriptedModel`, synchronous
+`AgentLoop`, exact call/result pairing, error feedback, step limits, and
+`COMPLETED_UNVERIFIED` termination.
 
-- immutable internal protocol objects;
-- a `ModelClient` protocol and non-streaming OpenAI-compatible Chat Completions
-  adapter;
-- conversion of provider responses into internal `ModelResponse` values;
-- bounded provider retry classification;
-- a `ToolRegistry` with a deliberately small JSON Schema subset;
-- a synchronous `AgentLoop`;
-- a deterministic, network-free `ScriptedModel` and unit tests;
-- a minimal `argparse` CLI with no production tools.
+Milestone 2 is complete. It adds:
 
-No agent framework or agent SDK is used. The harness owns message conversion,
-tool-call argument parsing, call/result identity, parameter validation, history,
-loop control, error classification, retries, and termination.
+- `WorkspaceGuard` and canonical path containment;
+- bounded UTF-8 `list_files`, `read_file`, and `search_text` tools;
+- SHA-guarded `edit_file` and `write_file` with atomic replacement;
+- `CommandPolicy` and argv-only `run_command`;
+- in-workspace `cwd`, process timeout/cleanup, bounded stdout/stderr previews,
+  and child-environment filtering;
+- a production tool-registration entry point and CLI composition;
+- fully offline unit and `ScriptedModel` integration tests against real
+  temporary workspaces and local processes.
 
-Milestone 2 functionality is not implemented: file/search/edit/write tools,
-command execution, `WorkspaceGuard`, path or symlink protection, and command
-safety. Milestone 3 functionality is also not implemented: a Verification Gate,
-mutation/verification sequencing, context compression, trace, replay, rollback,
-or debugging logs. There are no placeholder implementations for these features.
+Milestone 3 is not implemented. Its future scope is the Verification Gate,
+explicit completion request, mutation/verification tracking, verification
+freshness, repair rounds, JSONL trace data, and replay/debugging.
 
-## Internal protocol
+There is currently no `VERIFIED` state. A model may call pytest and observe exit
+code zero, but that is not independent Harness verification. Normal completion
+remains `COMPLETED_UNVERIFIED`.
 
-`protocol.py` defines string enums for roles, finish reasons, error kinds, and
-agent states. Frozen dataclasses define:
+## Preserved loop contract
 
-- `ToolCall(id, name, arguments)`;
-- `ToolResult(call_id, tool_name, ok, content, error_kind, retryable, metadata)`;
-- `ModelResponse(text, tool_calls, finish_reason, usage)`;
-- `Message(role, content, tool_calls, tool_result)`;
-- `AgentError` and `AgentResult`.
+Provider SDK values do not enter `AgentLoop`. `ModelClient` never executes a
+tool. `AgentLoop` never calls a concrete file or process handler and knows no
+path, SHA, command, or subprocess rule. It executes each returned `ToolCall`
+serially and only through `ToolRegistry.execute`.
 
-Protocol objects never contain OpenAI SDK response objects. A `ToolCall.id` is
-copied unchanged to exactly one `ToolResult.call_id` so a later model request can
-associate results with calls.
+Each call produces exactly one `ToolResult` with the unchanged call ID. Expected
+tool failures are represented by `ToolExecutionError`, which the registry turns
+into a failed result whose deterministic JSON content includes the error kind,
+message, retryability, and bounded details. Thus both internal tests and a real
+provider can see errors on the next turn. Tool failure does not terminate the
+loop. `max_steps` still counts model calls and prevents call N+1.
 
-## Model contract and provider errors
+## Workspace and path rules
 
-`ModelClient.complete(messages, tools) -> ModelResponse` is the only model
-contract known by the loop. `OpenAICompatibleModel` sends a non-streaming Chat
-Completions request and translates the first assistant choice to this contract.
-It preserves tool-call order, IDs, names, parsed object arguments, text, internal
-finish reason, and available input/output/total token counts.
+`WorkspaceGuard` requires an existing directory and stores its canonical
+resolved root. Model paths must be non-empty relative paths; native absolute
+paths, Windows drive-relative/absolute paths, UNC paths, and canonical paths
+outside the root are rejected. Every `..` component is rejected even when later
+components would return inside the workspace. Windows colon/alternate-data-
+stream components are also rejected. Containment uses path components and
+`Path.is_relative_to`, never string prefix comparison.
 
-Assistant `content=None` becomes an empty string. Tool arguments are parsed with
-the standard-library `json` module. Invalid JSON or a valid non-object top level
-raises `ModelProtocolError`; no tool can execute from such a response.
+Read and traversal paths are resolved before use. Directory traversal does not
+follow symlink/reparse-point directories. A symlink that resolves outside the
+workspace cannot be read or used as a write route. Edit and overwrite reject a
+final symlink. File tools protect the following basenames case-insensitively:
 
-A `complete` operation makes at most three provider requests: the initial
-request and two retries. Timeouts, connection errors, rate limits, HTTP 408/409,
-HTTP 429, and HTTP 5xx are retryable. Authentication, permission, bad-request,
-not-found, model/configuration, and other non-transient failures are fatal.
-Retry exhaustion becomes `PROVIDER_RETRY_EXHAUSTED`; a fatal error becomes
-`PROVIDER_FATAL_ERROR` immediately. Sleep is injectable, so tests never wait.
+- `.env` and `.env.*`;
+- `*.pem` and `*.key`;
+- `id_rsa` and `id_ed25519`;
+- `credentials.json` and `serviceAccountKey.json`.
 
-## Tool registry contract
+Writes additionally reject any `.git` or `.veriloop` path component. Matching
+uses complete components/globs, so ordinary names containing `env` or `key` do
+not match by substring.
 
-`ToolSpec` stores a name, description, input schema, Python handler, and
-`mutates_workspace` flag. `ToolRegistry.schemas()` exposes only standard model
-tool schemas—not handlers or registry internals. `execute()` is the only handler
-invocation path used by `AgentLoop`.
+File content is limited to ordinary UTF-8 text with no NUL byte and at most
+1 MiB by default. Directories, non-regular files, invalid UTF-8, binary/NUL
+content, and oversized data produce structured failures without traceback.
 
-Duplicate names raise an explicit registration error. Execution always returns
-one `ToolResult`, including for unknown tools, invalid arguments, and handler
-exceptions. Supported schema types are object, string, integer, number, boolean,
-and array, with object `properties`, `required`, and `additionalProperties`.
-Undeclared object fields are rejected by default. Python `bool` is deliberately
-excluded from integer and number matches.
+## File tools
 
-Tool errors do not terminate the loop. Their `ToolResult` is appended to history
-so the next assistant turn can correct the name or arguments.
+### `list_files`
 
-## Agent loop and termination
+Inputs are `path` (default `.`), `max_depth` (default 3, range 1..20), and
+`max_results` (default 300, range 1..1000). Results use workspace-relative POSIX
+paths, contain file/directory/symlink types and file sizes, and are sorted
+deterministically. Traversal skips `.git`, `.veriloop`, Python/tool caches,
+virtual environments, `node_modules`, `dist`, and `build`. It never follows a
+symlink directory and reports `truncated=true` when another result exceeds the
+bound.
 
-One step is one `ModelClient.complete` call. For `max_steps=N`, the loop makes no
-more than N such calls and checks the remaining budget before each call.
+### `read_file`
 
-The loop:
+Inputs are `path`, `start_line` (default 1), and `end_line` (default 400).
+Line numbering starts at 1, ranges must be ordered, and one call may request at
+most 500 lines. The result contains requested and actual ranges, total line
+count, SHA-256 of the exact original bytes, numbered text, and a truncation flag.
 
-1. appends `SYSTEM`, then `USER` to history;
-2. calls the model with a copy of complete history and current tool schemas;
-3. appends one `ASSISTANT` message containing all text and tool calls;
-4. if calls exist, executes them serially in model order through `ToolRegistry`;
-5. appends exactly one `TOOL` message/result per call, preserving each ID;
-6. calls the model again only after every result from that turn is present;
-7. stops on a response with no tool calls.
+### `search_text`
 
-A final text response terminates only as `COMPLETED_UNVERIFIED`. This means the
-model has stopped asking for tools and supplied final text; no independent
-Verification Gate exists yet, so the state must not be described as verified or
-successful. Other terminal states are `FAILED`, `MAX_STEPS`, and `CANCELLED`.
-Model protocol/fatal/retry-exhausted errors produce `FAILED`; `KeyboardInterrupt`
-produces `CANCELLED`.
+Inputs are non-empty literal `query`, `path` (default `.`), `case_sensitive`
+(default false), and `max_results` (default 50, range 1..500). Search is standard
+library only, deterministic, and recursive. It skips the same directories,
+sensitive files, symlinks, binary/non-UTF-8 files, and oversized files. Each
+match has a relative path, 1-based line number, and bounded line preview.
+
+### `edit_file`
+
+Inputs are `path`, non-empty `old_text`, `new_text`, and `expected_sha256`.
+The existing regular text file must have the expected digest. Identical old/new
+text is `NO_CHANGE`; zero exact occurrences is `EDIT_TEXT_NOT_FOUND`; multiple,
+including overlapping, occurrences are `EDIT_TEXT_AMBIGUOUS`. No failure changes
+the file. Exactly one occurrence is replaced in memory, encoded/size-checked,
+written to a temporary file in the same directory, flushed and fsynced, given
+the original permission bits, SHA-checked again, then installed with
+`os.replace`. Success returns before/after digests, one replacement, line counts,
+and a bounded diff preview.
+
+### `write_file`
+
+Inputs are `path`, `content`, `mode` (`create` or `overwrite`), and optional
+nullable `expected_sha256`. Create requires a missing target, an existing parent
+directory, and no expected digest. It never creates parent directories or
+overwrites an existing target. Overwrite requires an existing regular text file
+and matching digest. Both modes use the same-directory temporary file and atomic
+replacement flow. Append, delete, rename, chmod, and arbitrary directory
+creation are not exposed.
+
+## Command tool
+
+`run_command` accepts only `argv: list[str]`, relative `cwd` (default `.`), and
+integer `timeout_seconds` (default 60, maximum 120). The registry validates the
+schema and `CommandPolicy` validates the command shape. No command string or
+shell option exists; `CommandRunner` always calls `subprocess.Popen` with
+`shell=False`, `stdin=DEVNULL`, and a canonical in-workspace directory.
+
+Shell hosts, privilege/destructive tools, downloaders, remote shells, package
+managers, and mutating Git subcommands are denied. Git must use its bare program
+name and is limited to `status`, `diff`, `log`, `show`, `ls-files`, and
+`rev-parse`, with selected side-effect options denied. Python is limited to the
+current interpreter or common aliases, an in-workspace relative `.py` script,
+or modules `pytest`, `unittest`, and `compileall`; `-c` and `-m pip` are denied.
+A host may inject additional bare program names or absolute program paths, but
+hard denials still apply.
+
+Stdout and stderr go to separate temporary files rather than Python pipes, so
+they do not accumulate without bound in Python memory. Each model-visible
+preview is about 16 KiB, remains bounded after UTF-8 replacement decoding, and
+preserves both head and tail with an omitted-byte marker. The result includes
+exit code, duration, both previews, truncation flags, and exact total byte
+counts. Temporary output files are removed after the tool.
+
+Exit zero is a successful tool result. Nonzero exit is
+`COMMAND_NONZERO_EXIT`; timeout is `COMMAND_TIMEOUT`; process creation failure is
+`COMMAND_START_ERROR`. All are tool observations returned to the model rather
+than AgentLoop crashes. POSIX starts a new session and terminates/kills the
+process group on timeout. Windows creates a new process group but guarantees
+cleanup only for the direct child; descendant cleanup is best effort.
+
+The child environment is constructed from an explicit allowlist. Environment
+names containing `KEY`, `TOKEN`, `SECRET`, `PASSWORD`, `PASSWD`, `AUTH`,
+`COOKIE`, or `CREDENTIAL` are filtered again. Provider keys, including
+`OPENAI_API_KEY`, are not inherited.
+
+## Security boundary and excluded work
+
+Workspace containment governs VeriLoop file handlers, not code executed by an
+allowed process. `cwd` containment is not filesystem isolation. A repository
+Python script or test can still try to access outside paths or the network. The
+project has no container, VM, namespace, SELinux, Landlock, or Windows Job
+Object enforcement and should run only in trusted or disposable workspaces.
+
+Milestone 2 does not contain a Verification Gate, completion tool, baseline or
+final verification, mutation/verification sequence, repair loop, protected
+acceptance tests, persistent trace/event writer, replay, rollback, session
+resume, Git mutation tool, context compression, repo map, AST editing, patch
+parser, streaming, parallel tools, UI, multiple agents, MCP, plugins, or
+dependency download/install behavior.

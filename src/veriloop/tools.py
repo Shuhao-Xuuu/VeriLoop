@@ -5,12 +5,34 @@ from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
 import json
-from typing import Any, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable, Iterable
 
 from .protocol import ErrorKind, ToolCall, ToolResult
 
+if TYPE_CHECKING:
+    from .filesystem import WorkspaceGuard
+    from .process import CommandRunner
+
 
 ToolHandler = Callable[[dict[str, Any]], Any]
+
+
+class ToolExecutionError(RuntimeError):
+    """A safe, expected handler failure that becomes a structured ToolResult."""
+
+    def __init__(
+        self,
+        kind: ErrorKind,
+        message: str,
+        *,
+        retryable: bool = False,
+        metadata: dict[str, Any] | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.kind = kind
+        self.retryable = retryable
+        self.metadata = dict(metadata or {})
 
 
 @dataclass(frozen=True, slots=True)
@@ -68,6 +90,14 @@ class ToolRegistry:
 
         try:
             value = spec.handler(call.arguments)
+        except ToolExecutionError as exc:
+            return _tool_failure(
+                call,
+                exc.kind,
+                str(exc),
+                retryable=exc.retryable,
+                metadata=exc.metadata,
+            )
         except Exception as exc:
             return _tool_failure(
                 call,
@@ -83,14 +113,222 @@ class ToolRegistry:
         )
 
 
-def _tool_failure(call: ToolCall, kind: ErrorKind, message: str) -> ToolResult:
+def register_filesystem_tools(
+    registry: ToolRegistry,
+    guard: WorkspaceGuard,
+) -> None:
+    """Register the five production file tools bound to one WorkspaceGuard."""
+
+    from .filesystem import edit_file, list_files, read_file, search_text, write_file
+
+    registry.register(
+        ToolSpec(
+            name="list_files",
+            description="List bounded workspace contents without following symlink directories.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "default": "."},
+                    "max_depth": {
+                        "type": "integer",
+                        "default": 3,
+                        "minimum": 1,
+                        "maximum": 20,
+                    },
+                    "max_results": {
+                        "type": "integer",
+                        "default": 300,
+                        "minimum": 1,
+                        "maximum": 1000,
+                    },
+                },
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: list_files(guard, **arguments),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="read_file",
+            description="Read a bounded line range from one UTF-8 workspace file and return its SHA-256.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "start_line": {
+                        "type": "integer",
+                        "default": 1,
+                        "minimum": 1,
+                    },
+                    "end_line": {
+                        "type": "integer",
+                        "default": 400,
+                        "minimum": 1,
+                    },
+                },
+                "required": ["path"],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: read_file(guard, **arguments),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="search_text",
+            description="Search workspace UTF-8 files for a bounded set of literal text matches.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"},
+                    "path": {"type": "string", "default": "."},
+                    "case_sensitive": {"type": "boolean", "default": False},
+                    "max_results": {
+                        "type": "integer",
+                        "default": 50,
+                        "minimum": 1,
+                        "maximum": 500,
+                    },
+                },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: search_text(guard, **arguments),
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="edit_file",
+            description="Replace exactly one text occurrence after matching the file's SHA-256.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "old_text": {"type": "string"},
+                    "new_text": {"type": "string"},
+                    "expected_sha256": {"type": "string"},
+                },
+                "required": [
+                    "path",
+                    "old_text",
+                    "new_text",
+                    "expected_sha256",
+                ],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: edit_file(guard, **arguments),
+            mutates_workspace=True,
+        )
+    )
+    registry.register(
+        ToolSpec(
+            name="write_file",
+            description="Atomically create or SHA-guarded overwrite one UTF-8 workspace file.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "path": {"type": "string", "minLength": 1},
+                    "content": {"type": "string"},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["create", "overwrite"],
+                    },
+                    "expected_sha256": {"type": ["string", "null"]},
+                },
+                "required": ["path", "content", "mode"],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: write_file(guard, **arguments),
+            mutates_workspace=True,
+        )
+    )
+
+
+def register_process_tool(registry: ToolRegistry, runner: CommandRunner) -> None:
+    """Register the production run_command handler."""
+
+    registry.register(
+        ToolSpec(
+            name="run_command",
+            description="Run one allowlisted argv command in a workspace directory with bounded output.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "argv": {
+                        "type": "array",
+                        "items": {"type": "string"},
+                        "minItems": 1,
+                    },
+                    "cwd": {"type": "string", "default": "."},
+                    "timeout_seconds": {
+                        "type": "integer",
+                        "default": 60,
+                        "minimum": 1,
+                        "maximum": 120,
+                    },
+                },
+                "required": ["argv"],
+                "additionalProperties": False,
+            },
+            handler=runner,
+        )
+    )
+
+
+def register_workspace_tools(
+    registry: ToolRegistry,
+    guard: WorkspaceGuard,
+    runner: CommandRunner,
+) -> None:
+    """Register every Milestone 2 production tool on an existing registry."""
+
+    register_filesystem_tools(registry, guard)
+    register_process_tool(registry, runner)
+
+
+def build_workspace_tools(
+    workspace: str | Path,
+    *,
+    additional_allowed_programs: Iterable[str] = (),
+    max_file_bytes: int = 1024 * 1024,
+) -> ToolRegistry:
+    """Build the complete production registry bound to one workspace."""
+
+    from .filesystem import WorkspaceGuard
+    from .process import CommandPolicy, CommandRunner
+
+    guard = WorkspaceGuard(workspace, max_file_bytes=max_file_bytes)
+    policy = CommandPolicy(additional_allowed_programs)
+    runner = CommandRunner(guard, policy)
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    return registry
+
+
+def _tool_failure(
+    call: ToolCall,
+    kind: ErrorKind,
+    message: str,
+    *,
+    retryable: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> ToolResult:
+    details = dict(metadata or {})
     return ToolResult(
         call_id=call.id,
         tool_name=call.name,
         ok=False,
-        content=message,
+        content=_stringify_result(
+            {
+                "error_kind": kind.value,
+                "message": message,
+                "retryable": retryable,
+                "details": details,
+            }
+        ),
         error_kind=kind,
-        retryable=False,
+        retryable=retryable,
+        metadata=details,
     )
 
 
@@ -107,8 +345,29 @@ def _stringify_result(value: Any) -> str:
 
 def _validate_value(value: Any, schema: dict[str, Any], path: str) -> str | None:
     expected_type = schema.get("type")
-    if expected_type is not None and not _matches_type(value, expected_type):
-        return f"{path} must be of type {expected_type}"
+    if expected_type is not None and not _matches_any_type(value, expected_type):
+        if isinstance(expected_type, list):
+            label = " or ".join(str(item) for item in expected_type)
+        else:
+            label = str(expected_type)
+        return f"{path} must be of type {label}"
+
+    allowed_values = schema.get("enum")
+    if allowed_values is not None and value not in allowed_values:
+        return f"{path} must be one of {allowed_values}"
+
+    if isinstance(value, str):
+        min_length = schema.get("minLength")
+        if isinstance(min_length, int) and len(value) < min_length:
+            return f"{path} must contain at least {min_length} characters"
+
+    if isinstance(value, int) and not isinstance(value, bool):
+        minimum = schema.get("minimum")
+        maximum = schema.get("maximum")
+        if isinstance(minimum, int) and value < minimum:
+            return f"{path} must be greater than or equal to {minimum}"
+        if isinstance(maximum, int) and value > maximum:
+            return f"{path} must be less than or equal to {maximum}"
 
     if expected_type == "object":
         properties = schema.get("properties", {})
@@ -134,7 +393,27 @@ def _validate_value(value: Any, schema: dict[str, Any], path: str) -> str | None
             if error is not None:
                 return error
 
+    if isinstance(value, list):
+        min_items = schema.get("minItems")
+        max_items = schema.get("maxItems")
+        if isinstance(min_items, int) and len(value) < min_items:
+            return f"{path} must contain at least {min_items} items"
+        if isinstance(max_items, int) and len(value) > max_items:
+            return f"{path} must contain at most {max_items} items"
+        item_schema = schema.get("items")
+        if isinstance(item_schema, dict):
+            for index, item in enumerate(value):
+                error = _validate_value(item, item_schema, f"{path}[{index}]")
+                if error is not None:
+                    return error
+
     return None
+
+
+def _matches_any_type(value: Any, expected_type: str | Iterable[str]) -> bool:
+    if isinstance(expected_type, str):
+        return _matches_type(value, expected_type)
+    return any(_matches_type(value, item) for item in expected_type)
 
 
 def _matches_type(value: Any, expected_type: str) -> bool:
@@ -150,4 +429,6 @@ def _matches_type(value: Any, expected_type: str) -> bool:
         return isinstance(value, bool)
     if expected_type == "array":
         return isinstance(value, list)
+    if expected_type == "null":
+        return value is None
     return False
