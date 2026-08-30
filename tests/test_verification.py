@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 import hashlib
 import json
 from pathlib import Path
@@ -1599,3 +1599,392 @@ argv = ["python", "verify.py"]
     assert result.final_verification is not None
     assert result.final_verification.passed is False
     assert result.verified_seq is None
+
+
+def test_failure_signature_is_stable_across_duration_and_workspace_paths(
+    tmp_path: Path,
+) -> None:
+    signatures: list[str | None] = []
+    volatile_values = (
+        (
+            "workspace-one",
+            "2026-08-31T01:02:03.123Z",
+            "0.07s",
+            "1234",
+            "11111111-1111-4111-8111-111111111111",
+            "pytest-42",
+        ),
+        (
+            "workspace-two",
+            "2027-09-30T11:12:13.987Z",
+            "8.91s",
+            "9876",
+            "22222222-2222-4222-8222-222222222222",
+            "pytest-999",
+        ),
+    )
+    for name, timestamp, duration, pid, run_id, temp_name in volatile_values:
+        workspace = tmp_path / name
+        workspace.mkdir()
+        (workspace / "verify.py").write_text(
+            (
+                "from pathlib import Path\n"
+                f"print('timestamp={timestamp}')\n"
+                f"print('duration={duration}')\n"
+                f"print('pid={pid} run_id={run_id} seq=1')\n"
+                f"print(Path.cwd() / 'pytest-of-user' / '{temp_name}' / 'failure.txt')\n"
+                "print('same deterministic assertion failure')\n"
+                "raise SystemExit(3)\n"
+            ),
+            encoding="utf-8",
+        )
+        _, verification_gate = verification_stack(
+            workspace,
+            f"""
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py", "{(workspace / temp_name).as_posix()}"]
+""",
+        )
+        signatures.append(
+            verification_gate.run_final(mutation_seq=0).failure_signature
+        )
+
+    assert signatures[0] is not None
+    assert signatures[0] == signatures[1]
+
+
+def test_materially_different_failures_have_different_signatures(
+    tmp_path: Path,
+) -> None:
+    verify = tmp_path / "verify.py"
+    verify.write_text("print('alpha')\nraise SystemExit(1)\n", encoding="utf-8")
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+
+    first = verification_gate.run_final(mutation_seq=0)
+    verify.write_text("print('time=fast')\nraise SystemExit(1)\n", encoding="utf-8")
+    second = verification_gate.run_final(mutation_seq=1)
+    verify.write_text("print('time=slow')\nraise SystemExit(1)\n", encoding="utf-8")
+    third = verification_gate.run_final(mutation_seq=2)
+    verify.write_text("print('time=slow')\nraise SystemExit(2)\n", encoding="utf-8")
+    fourth = verification_gate.run_final(mutation_seq=3)
+
+    assert first.failure_signature is not None
+    assert second.failure_signature is not None
+    assert third.failure_signature is not None
+    assert fourth.failure_signature is not None
+    assert first.failure_signature != second.failure_signature
+    assert second.failure_signature != third.failure_signature
+    assert third.failure_signature != fourth.failure_signature
+
+
+def test_failure_signature_uses_tail_not_output_truncation_state(
+    tmp_path: Path,
+) -> None:
+    verify = tmp_path / "verify.py"
+    stable_tail = "z" * 3000
+    verify.write_text(
+        f"print('short-prefix' + {stable_tail!r})\nraise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+
+    first = verification_gate.run_final(mutation_seq=0)
+    verify.write_text(
+        f"print({'x' * 70000!r} + {stable_tail!r})\nraise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    second = verification_gate.run_final(mutation_seq=1)
+
+    assert first.commands[0].stdout_truncated is False
+    assert second.commands[0].stdout_truncated is True
+    assert first.failure_signature == second.failure_signature
+
+
+def test_missing_failure_signature_does_not_trigger_stalled(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 1
+max_same_failure = 1
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    run_final = verification_gate.run_final
+
+    def run_without_signature(*, mutation_seq: int) -> VerificationResult:
+        return replace(
+            run_final(mutation_seq=mutation_seq),
+            failure_signature=None,
+        )
+
+    monkeypatch.setattr(verification_gate, "run_final", run_without_signature)
+    model = ScriptedModel(
+        [
+            tool_response(
+                ToolCall(
+                    id="unsigned-first",
+                    name="complete_task",
+                    arguments={"summary": "first"},
+                )
+            ),
+            tool_response(
+                ToolCall(
+                    id="unsigned-second",
+                    name="complete_task",
+                    arguments={"summary": "second"},
+                )
+            ),
+            final_response("must not be requested"),
+        ]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFICATION_FAILED
+    assert result.repair_rounds_used == 1
+    assert model.call_count == 2
+
+
+def test_repeated_failure_signature_stops_as_stalled_before_budget_exhaustion(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "always_fail.py").write_text(
+        """
+from pathlib import Path
+path = Path("attempts.txt")
+count = int(path.read_text()) if path.exists() else 0
+path.write_text(str(count + 1))
+raise SystemExit(5)
+""",
+        encoding="utf-8",
+    )
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 5
+max_same_failure = 2
+[[verification.commands]]
+argv = ["python", "always_fail.py"]
+""",
+    )
+    completions = [
+        tool_response(
+            ToolCall(
+                id=f"stalled-{index}",
+                name="complete_task",
+                arguments={"summary": f"attempt {index}"},
+            )
+        )
+        for index in range(3)
+    ]
+    model = ScriptedModel(completions)
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.STALLED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.STALLED
+    assert result.repair_rounds_used == 1
+    assert model.call_count == 2
+    assert (tmp_path / "attempts.txt").read_text(encoding="utf-8") == "2"
+    last_result = result.history[-1].tool_result
+    assert last_result is not None
+    assert last_result.call_id == "stalled-1"
+    assert last_result.error_kind is ErrorKind.STALLED
+    assert last_result.retryable is False
+    payload = json.loads(last_result.content)
+    assert payload["same_failure_count"] == 2
+    assert payload["state"] == AgentState.STALLED.value
+    assert payload["failure_kind"] == ErrorKind.VERIFICATION_FAILED.value
+    assert payload["termination_kind"] == ErrorKind.STALLED.value
+    assert result.final_verification is not None
+    assert payload["failure_signature"] == result.final_verification.failure_signature
+    assert result.state_history[-1] is AgentState.STALLED
+
+
+def test_max_same_failure_one_stalls_on_first_failure(tmp_path: Path) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 0
+max_same_failure = 1
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    completion = ToolCall(
+        id="stall-now",
+        name="complete_task",
+        arguments={"summary": "attempt"},
+    )
+    model = ScriptedModel([tool_response(completion), final_response("extra")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.STALLED
+    assert result.repair_rounds_used == 0
+    assert model.call_count == 1
+
+
+def test_failure_counter_restarts_before_a_new_signature_can_stall(
+    tmp_path: Path,
+) -> None:
+    verify = tmp_path / "verify.py"
+    original = b"print('failure-a')\nraise SystemExit(1)\n"
+    verify.write_bytes(original)
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 5
+max_same_failure = 2
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    first = ToolCall(
+        id="restart-first",
+        name="complete_task",
+        arguments={"summary": "failure A"},
+    )
+    edit = ToolCall(
+        id="restart-edit",
+        name="edit_file",
+        arguments={
+            "path": "verify.py",
+            "old_text": "print('failure-a')\nraise SystemExit(1)",
+            "new_text": "print('failure-b')\nraise SystemExit(2)",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    second = ToolCall(
+        id="restart-second",
+        name="complete_task",
+        arguments={"summary": "first failure B"},
+    )
+    third = ToolCall(
+        id="restart-third",
+        name="complete_task",
+        arguments={"summary": "second failure B"},
+    )
+    model = ScriptedModel(
+        [
+            tool_response(first),
+            tool_response(edit),
+            tool_response(second),
+            tool_response(third),
+        ]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.STALLED
+    assert result.repair_rounds_used == 2
+    assert model.call_count == 4
+    assert result.final_verification is not None
+    last_result = result.history[-1].tool_result
+    assert last_result is not None
+    assert last_result.call_id == "restart-third"
+    assert json.loads(last_result.content)["same_failure_count"] == 2
+
+
+def test_different_consecutive_failure_resets_stall_counter(tmp_path: Path) -> None:
+    verify = tmp_path / "verify.py"
+    original = b"print('one')\nraise SystemExit(1)\n"
+    verify.write_bytes(original)
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 1
+max_same_failure = 2
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    first = ToolCall(
+        id="different-first",
+        name="complete_task",
+        arguments={"summary": "first"},
+    )
+    edit = ToolCall(
+        id="different-edit",
+        name="edit_file",
+        arguments={
+            "path": "verify.py",
+            "old_text": "print('one')\nraise SystemExit(1)",
+            "new_text": "print('two')\nraise SystemExit(2)",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    second = ToolCall(
+        id="different-second",
+        name="complete_task",
+        arguments={"summary": "second"},
+    )
+    model = ScriptedModel(
+        [tool_response(first), tool_response(edit), tool_response(second)]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFICATION_FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.VERIFICATION_FAILED
+    assert result.repair_rounds_used == 1
+    assert result.final_verification is not None
+    final_result = result.history[-1].tool_result
+    assert final_result is not None
+    assert json.loads(final_result.content)["same_failure_count"] == 1

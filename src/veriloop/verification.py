@@ -5,9 +5,12 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import json
 import os
 from pathlib import Path
+import re
 import stat
+import tempfile
 import tomllib
 from typing import Any
 
@@ -144,6 +147,11 @@ class VerificationGate:
     def run_final(self, *, mutation_seq: int) -> VerificationResult:
         before_changes = self.protected_changes()
         if not self.spec.commands:
+            failure_kind = (
+                ErrorKind.PROTECTED_FILE_CHANGED
+                if before_changes
+                else ErrorKind.VERIFICATION_FAILED
+            )
             return VerificationResult(
                 phase=VerificationPhase.FINAL,
                 passed=False,
@@ -152,10 +160,12 @@ class VerificationGate:
                 protected_changes=before_changes,
                 mutation_seq=mutation_seq,
                 verified_seq=None,
-                failure_kind=(
-                    ErrorKind.PROTECTED_FILE_CHANGED
-                    if before_changes
-                    else ErrorKind.VERIFICATION_FAILED
+                failure_kind=failure_kind,
+                failure_signature=_failure_signature(
+                    commands=(),
+                    protected_changes=before_changes,
+                    failure_kind=failure_kind,
+                    workspace_root=self._runner.guard.root,
                 ),
             )
 
@@ -187,6 +197,16 @@ class VerificationGate:
             mutation_seq=mutation_seq,
             verified_seq=mutation_seq if passed else None,
             failure_kind=failure_kind,
+            failure_signature=(
+                None
+                if failure_kind is None
+                else _failure_signature(
+                    commands=commands,
+                    protected_changes=protected_changes,
+                    failure_kind=failure_kind,
+                    workspace_root=self._runner.guard.root,
+                )
+            ),
         )
 
     def grants_verified(
@@ -362,6 +382,133 @@ def _merge_protected_changes(
         for change in group
     }
     return tuple(unique[key] for key in sorted(unique))
+
+
+def _failure_signature(
+    *,
+    commands: tuple[VerificationCommandResult, ...],
+    protected_changes: tuple[ProtectedFileChange, ...],
+    failure_kind: ErrorKind,
+    workspace_root: Path,
+) -> str:
+    payload = {
+        "failure_kind": failure_kind.value,
+        "commands": [
+            {
+                "argv": [
+                    _normalized_failure_text(argument, workspace_root)
+                    for argument in command.argv
+                ],
+                "cwd": _normalized_failure_text(command.cwd, workspace_root),
+                "exit_code": command.exit_code,
+                "timed_out": command.timed_out,
+                "started": command.started,
+                "error_kind": (
+                    command.error_kind.value
+                    if command.error_kind is not None
+                    else None
+                ),
+                "stdout_tail": _normalized_failure_tail(
+                    command.stdout,
+                    workspace_root,
+                ),
+                "stderr_tail": _normalized_failure_tail(
+                    command.stderr,
+                    workspace_root,
+                ),
+            }
+            for command in commands
+        ],
+        "protected_changes": [
+            {"path": change.relative_path, "kind": change.kind.value}
+            for change in sorted(
+                protected_changes,
+                key=lambda item: (item.relative_path, item.kind.value),
+            )
+        ],
+    }
+    encoded = json.dumps(
+        payload,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def _normalized_failure_tail(text: str, workspace_root: Path) -> str:
+    return _normalized_failure_text(text, workspace_root)[-2048:]
+
+
+def _normalized_failure_text(text: str, workspace_root: Path) -> str:
+    normalized = text
+    root_values = {
+        str(workspace_root),
+        workspace_root.as_posix(),
+        str(workspace_root).replace("\\", "/"),
+        str(workspace_root).replace("/", "\\"),
+    }
+    flags = re.IGNORECASE if os.name == "nt" else 0
+    for root_value in sorted(root_values, key=len, reverse=True):
+        if root_value:
+            normalized = re.sub(
+                re.escape(root_value),
+                "<workspace>",
+                normalized,
+                flags=flags,
+            )
+
+    temp_root = Path(tempfile.gettempdir())
+    temp_values = {
+        str(temp_root),
+        temp_root.as_posix(),
+        str(temp_root).replace("\\", "/"),
+        str(temp_root).replace("/", "\\"),
+    }
+    for temp_value in sorted(temp_values, key=len, reverse=True):
+        if temp_value:
+            normalized = re.sub(
+                re.escape(temp_value),
+                "<temp>",
+                normalized,
+                flags=flags,
+            )
+
+    substitutions = (
+        (
+            r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}"
+            r"(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?\b",
+            "<timestamp>",
+        ),
+        (
+            r"(?i)\b(timestamp|date|time)\s*[:=]\s*"
+            r"(?:\d{4}-\d{2}-\d{2}(?:[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?)?"
+            r"|\d{2}:\d{2}:\d{2}(?:\.\d+)?)",
+            r"\1=<timestamp>",
+        ),
+        (
+            r"(?i)\b(pid|process_id|seq(?:uence)?)\s*[:=]\s*\d+\b",
+            r"\1=<volatile>",
+        ),
+        (
+            r"(?i)\brun_id\s*[:=]\s*[a-z0-9][a-z0-9._-]*",
+            "run_id=<volatile>",
+        ),
+        (
+            r"(?i)\b(in|duration|elapsed|latency)\s*[:=]?\s*"
+            r"\d+(?:\.\d+)?\s*(?:ns|us|ms|s|sec(?:ond)?s?|minutes?)\b",
+            r"\1 <duration>",
+        ),
+        (r"(?i)<\d+ bytes omitted>", "<bytes omitted>"),
+        (
+            r"(?i)([\\/])(?:pytest-\d+|popen-gw\d+|tmp[a-z0-9_.-]{6,})"
+            r"(?=[\\/\s\"']|$)",
+            r"\1<random-temp>",
+        ),
+    )
+    for pattern, replacement in substitutions:
+        normalized = re.sub(pattern, replacement, normalized)
+    return normalized
 
 
 def protected_guard_for_spec(

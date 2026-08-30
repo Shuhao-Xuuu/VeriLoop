@@ -71,6 +71,8 @@ class AgentLoop:
         baseline_verification = None
         final_verification = None
         repair_rounds_used = 0
+        last_failure_signature = None
+        same_failure_count = 0
 
         def transition(next_state: AgentState) -> None:
             nonlocal state
@@ -307,6 +309,50 @@ class AgentLoop:
                 failure_kind = (
                     final_verification.failure_kind or ErrorKind.VERIFICATION_FAILED
                 )
+                failure_signature = final_verification.failure_signature
+                if failure_signature is None:
+                    last_failure_signature = None
+                    same_failure_count = 0
+                elif failure_signature == last_failure_signature:
+                    same_failure_count += 1
+                else:
+                    last_failure_signature = failure_signature
+                    same_failure_count = 1
+
+                if (
+                    failure_signature is not None
+                    and same_failure_count
+                    >= self._verification_gate.spec.max_same_failure
+                ):
+                    history.append(
+                        _tool_message(
+                            _verification_tool_result(
+                                call,
+                                final_verification,
+                                verified=False,
+                                retryable=False,
+                                remaining_repair_rounds=(
+                                    self._verification_gate.spec.max_repair_rounds
+                                    - repair_rounds_used
+                                ),
+                                terminal_state=AgentState.STALLED,
+                                error_kind_override=ErrorKind.STALLED,
+                                same_failure_count=same_failure_count,
+                            )
+                        )
+                    )
+                    transition(AgentState.STALLED)
+                    return finish(
+                        summary,
+                        error=AgentError(
+                            kind=ErrorKind.STALLED,
+                            message=(
+                                "verification stalled after repeated failure "
+                                f"signature: {failure_signature}"
+                            ),
+                        ),
+                    )
+
                 max_repair_rounds = self._verification_gate.spec.max_repair_rounds
                 if repair_rounds_used < max_repair_rounds:
                     remaining_repair_rounds = (
@@ -321,6 +367,7 @@ class AgentLoop:
                                 verified=False,
                                 retryable=True,
                                 remaining_repair_rounds=remaining_repair_rounds,
+                                same_failure_count=same_failure_count,
                             )
                         )
                     )
@@ -335,6 +382,7 @@ class AgentLoop:
                             verified=False,
                             retryable=False,
                             remaining_repair_rounds=0,
+                            same_failure_count=same_failure_count,
                         )
                     )
                 )
@@ -409,20 +457,25 @@ def _verification_tool_result(
     verified: bool,
     retryable: bool = False,
     remaining_repair_rounds: int = 0,
+    terminal_state: AgentState | None = None,
+    error_kind_override: ErrorKind | None = None,
+    same_failure_count: int = 0,
 ) -> ToolResult:
     failure_kind = verification.failure_kind or ErrorKind.VERIFICATION_FAILED
+    effective_error_kind = error_kind_override or failure_kind
+    result_state = (
+        AgentState.VERIFIED
+        if verified
+        else (
+            AgentState.RECOVERING
+            if retryable
+            else (terminal_state or AgentState.VERIFICATION_FAILED)
+        )
+    )
     payload = {
         "completion_requested": True,
         "verified": verified,
-        "state": (
-            AgentState.VERIFIED.value
-            if verified
-            else (
-                AgentState.RECOVERING.value
-                if retryable
-                else AgentState.VERIFICATION_FAILED.value
-            )
-        ),
+        "state": result_state.value,
         "mutation_seq": verification.mutation_seq,
         "verified_seq": verification.verified_seq,
         "protected_unchanged": verification.protected_unchanged,
@@ -454,6 +507,9 @@ def _verification_tool_result(
             for command in verification.commands
         ],
         "failure_kind": None if verified else failure_kind.value,
+        "termination_kind": None if verified else effective_error_kind.value,
+        "failure_signature": verification.failure_signature,
+        "same_failure_count": same_failure_count,
         "remaining_repair_rounds": remaining_repair_rounds,
     }
     return ToolResult(
@@ -461,7 +517,7 @@ def _verification_tool_result(
         tool_name=call.name,
         ok=verified,
         content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
-        error_kind=None if verified else failure_kind,
+        error_kind=None if verified else effective_error_kind,
         retryable=retryable,
         metadata={
             "completion_requested": True,
@@ -471,5 +527,7 @@ def _verification_tool_result(
             "verified_seq": verification.verified_seq,
             "retryable": retryable,
             "remaining_repair_rounds": remaining_repair_rounds,
+            "same_failure_count": same_failure_count,
+            "failure_signature": verification.failure_signature,
         },
     )
