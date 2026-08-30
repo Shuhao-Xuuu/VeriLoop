@@ -5,10 +5,14 @@ from pathlib import Path
 
 import pytest
 
+from tests.scripted_model import ScriptedModel
+from veriloop.agent import AgentLoop
 from veriloop.protocol import (
     AgentResult,
     AgentState,
     ErrorKind,
+    FinishReason,
+    ModelResponse,
     ProtectedChangeKind,
     ProtectedFileChange,
     VerificationCommandResult,
@@ -17,9 +21,11 @@ from veriloop.protocol import (
 )
 from veriloop.filesystem import WorkspaceGuard
 from veriloop.process import CommandPolicy, CommandRunner
+from veriloop.tools import ToolRegistry
 from veriloop.verification import (
     BaselinePolicy,
     VerificationConfigError,
+    VerificationGate,
     load_verification_spec,
 )
 
@@ -34,6 +40,21 @@ def load(workspace: Path):
     guard = WorkspaceGuard(workspace)
     runner = CommandRunner(guard, CommandPolicy())
     return load_verification_spec(guard, runner)
+
+
+def gate(workspace: Path, text: str) -> VerificationGate:
+    write_config(workspace, text)
+    guard = WorkspaceGuard(workspace)
+    runner = CommandRunner(guard, CommandPolicy())
+    return VerificationGate(load_verification_spec(guard, runner), runner)
+
+
+def final_response(text: str = "done") -> ModelResponse:
+    return ModelResponse(
+        text=text,
+        tool_calls=(),
+        finish_reason=FinishReason.STOP,
+    )
 
 
 def test_verification_protocol_exposes_explicit_terminal_states_and_errors() -> None:
@@ -211,3 +232,222 @@ def test_sensitive_file_cannot_be_used_as_verification_config(tmp_path: Path) ->
         load_verification_spec(guard, runner, ".env")
 
     assert "do-not-read" not in str(captured.value)
+
+
+def test_baseline_skip_does_not_start_commands(tmp_path: Path) -> None:
+    (tmp_path / "must_not_run.py").write_text(
+        "from pathlib import Path\nPath('marker').write_text('ran')\n",
+        encoding="utf-8",
+    )
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "must_not_run.py"]
+""",
+    )
+    model = ScriptedModel([final_response()])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.baseline_verification is not None
+    assert result.baseline_verification.skipped is True
+    assert result.baseline_verification.commands == ()
+    assert not (tmp_path / "marker").exists()
+
+
+@pytest.mark.parametrize("exit_code", [0, 3])
+def test_baseline_record_only_records_exit_and_continues(
+    tmp_path: Path, exit_code: int
+) -> None:
+    (tmp_path / "baseline.py").write_text(
+        f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "record_only"
+[[verification.commands]]
+argv = ["python", "baseline.py"]
+""",
+    )
+    model = ScriptedModel([final_response()])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.baseline_verification is not None
+    assert result.baseline_verification.passed is True
+    assert result.baseline_verification.commands[0].exit_code == exit_code
+    assert result.mutation_seq == 0
+    assert model.call_count == 1
+
+
+def test_baseline_must_fail_accepts_real_red_evidence(tmp_path: Path) -> None:
+    (tmp_path / "red.py").write_text("raise SystemExit(7)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+[[verification.commands]]
+argv = ["python", "red.py"]
+""",
+    )
+    model = ScriptedModel([final_response()])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.baseline_verification is not None
+    assert result.baseline_verification.passed is True
+    assert result.baseline_verification.commands[0].started is True
+    assert result.baseline_verification.commands[0].exit_code == 7
+    assert model.call_count == 1
+
+
+def test_baseline_must_fail_rejects_unexpected_green_before_model(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "green.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+[[verification.commands]]
+argv = ["python", "green.py"]
+""",
+    )
+    model = ScriptedModel([])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.BASELINE_UNEXPECTED_PASS
+    assert result.step_count == 0
+    assert model.call_count == 0
+
+
+def test_baseline_timeout_is_infrastructure_failure_not_red(tmp_path: Path) -> None:
+    (tmp_path / "slow.py").write_text(
+        "import time\ntime.sleep(30)\n",
+        encoding="utf-8",
+    )
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+[[verification.commands]]
+argv = ["python", "slow.py"]
+timeout_seconds = 1
+""",
+    )
+    model = ScriptedModel([])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.BASELINE_INFRASTRUCTURE_ERROR
+    assert result.baseline_verification is not None
+    command = result.baseline_verification.commands[0]
+    assert command.started is True
+    assert command.timed_out is True
+    assert command.error_kind is ErrorKind.VERIFICATION_TIMEOUT
+    assert model.call_count == 0
+
+
+def test_baseline_start_error_is_infrastructure_failure(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "check.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "record_only"
+[[verification.commands]]
+argv = ["python", "check.py"]
+""",
+    )
+
+    def fail_to_start(*args, **kwargs):
+        raise OSError("fictional start failure")
+
+    monkeypatch.setattr("veriloop.process.subprocess.Popen", fail_to_start)
+    model = ScriptedModel([])
+
+    result = AgentLoop(
+        model,
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.BASELINE_INFRASTRUCTURE_ERROR
+    assert result.baseline_verification is not None
+    command = result.baseline_verification.commands[0]
+    assert command.started is False
+    assert command.error_kind is ErrorKind.VERIFICATION_START_ERROR
+    assert model.call_count == 0
+
+
+def test_baseline_runs_multiple_commands_in_frozen_order(tmp_path: Path) -> None:
+    (tmp_path / "first.py").write_text("raise SystemExit(2)\n", encoding="utf-8")
+    (tmp_path / "second.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+[[verification.commands]]
+argv = ["python", "first.py"]
+[[verification.commands]]
+argv = ["python", "second.py"]
+""",
+    )
+
+    result = AgentLoop(
+        ScriptedModel([final_response()]),
+        ToolRegistry(),
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.baseline_verification is not None
+    assert [command.argv[-1] for command in result.baseline_verification.commands] == [
+        "first.py",
+        "second.py",
+    ]
+    assert [command.exit_code for command in result.baseline_verification.commands] == [
+        2,
+        0,
+    ]

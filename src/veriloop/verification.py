@@ -10,7 +10,12 @@ from typing import Any
 
 from .filesystem import WorkspaceGuard
 from .process import CommandRunner
-from .protocol import ErrorKind
+from .protocol import (
+    ErrorKind,
+    VerificationCommandResult,
+    VerificationPhase,
+    VerificationResult,
+)
 from .tools import ToolExecutionError
 
 
@@ -46,6 +51,70 @@ class VerificationConfigError(ValueError):
     """A deterministic, safe-to-display verification configuration error."""
 
     kind = ErrorKind.INVALID_VERIFICATION_CONFIG
+
+
+class VerificationGate:
+    """Run frozen verification commands without owning the agent loop."""
+
+    def __init__(self, spec: VerificationSpec, runner: CommandRunner) -> None:
+        self.spec = spec
+        self._runner = runner
+
+    def run_baseline(self, *, mutation_seq: int = 0) -> VerificationResult:
+        if not self.spec.commands or self.spec.baseline_policy is BaselinePolicy.SKIP:
+            return VerificationResult(
+                phase=VerificationPhase.BASELINE,
+                passed=True,
+                commands=(),
+                protected_unchanged=True,
+                protected_changes=(),
+                mutation_seq=mutation_seq,
+                verified_seq=None,
+                skipped=True,
+            )
+
+        commands = tuple(
+            _run_verification_command(self._runner, command)
+            for command in self.spec.commands
+        )
+        infrastructure_failed = any(
+            not command.started or command.timed_out for command in commands
+        )
+        if infrastructure_failed:
+            return VerificationResult(
+                phase=VerificationPhase.BASELINE,
+                passed=False,
+                commands=commands,
+                protected_unchanged=True,
+                protected_changes=(),
+                mutation_seq=mutation_seq,
+                verified_seq=None,
+                failure_kind=ErrorKind.BASELINE_INFRASTRUCTURE_ERROR,
+            )
+
+        if self.spec.baseline_policy is BaselinePolicy.MUST_FAIL and all(
+            command.exit_code == 0 for command in commands
+        ):
+            return VerificationResult(
+                phase=VerificationPhase.BASELINE,
+                passed=False,
+                commands=commands,
+                protected_unchanged=True,
+                protected_changes=(),
+                mutation_seq=mutation_seq,
+                verified_seq=None,
+                failure_kind=ErrorKind.BASELINE_UNEXPECTED_PASS,
+            )
+
+        return VerificationResult(
+            phase=VerificationPhase.BASELINE,
+            passed=True,
+            commands=commands,
+            protected_unchanged=True,
+            protected_changes=(),
+            mutation_seq=mutation_seq,
+            verified_seq=None,
+        )
 
 
 def load_verification_spec(
@@ -270,3 +339,80 @@ def _commands(
             )
         )
     return tuple(commands)
+
+
+def _run_verification_command(
+    runner: CommandRunner,
+    command: VerificationCommandSpec,
+) -> VerificationCommandResult:
+    try:
+        metadata = runner.run(
+            list(command.argv),
+            cwd=command.cwd,
+            timeout_seconds=command.timeout_seconds,
+        )
+    except ToolExecutionError as exc:
+        metadata = exc.metadata
+        if exc.kind is ErrorKind.COMMAND_TIMEOUT:
+            error_kind = ErrorKind.VERIFICATION_TIMEOUT
+            started = True
+            timed_out = True
+        elif exc.kind is ErrorKind.COMMAND_NONZERO_EXIT:
+            error_kind = ErrorKind.VERIFICATION_FAILED
+            started = True
+            timed_out = False
+        else:
+            error_kind = ErrorKind.VERIFICATION_START_ERROR
+            started = False
+            timed_out = False
+        return _command_result(
+            command,
+            metadata,
+            started=started,
+            timed_out=timed_out,
+            error_kind=error_kind,
+        )
+
+    return _command_result(
+        command,
+        metadata,
+        started=True,
+        timed_out=False,
+        error_kind=None,
+    )
+
+
+def _command_result(
+    command: VerificationCommandSpec,
+    metadata: dict[str, Any],
+    *,
+    started: bool,
+    timed_out: bool,
+    error_kind: ErrorKind | None,
+) -> VerificationCommandResult:
+    raw_argv = metadata.get("argv", command.argv)
+    if isinstance(raw_argv, (list, tuple)) and all(
+        isinstance(item, str) for item in raw_argv
+    ):
+        argv = tuple(raw_argv)
+    else:
+        argv = command.argv
+    exit_code = metadata.get("exit_code")
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool):
+        exit_code = None
+    duration_ms = metadata.get("duration_ms", 0)
+    if not isinstance(duration_ms, int) or isinstance(duration_ms, bool):
+        duration_ms = 0
+    return VerificationCommandResult(
+        argv=argv,
+        cwd=str(metadata.get("cwd", command.cwd)),
+        exit_code=exit_code,
+        timed_out=timed_out,
+        started=started,
+        stdout=str(metadata.get("stdout", "")),
+        stderr=str(metadata.get("stderr", "")),
+        stdout_truncated=metadata.get("stdout_truncated") is True,
+        stderr_truncated=metadata.get("stderr_truncated") is True,
+        duration_ms=max(0, duration_ms),
+        error_kind=error_kind,
+    )
