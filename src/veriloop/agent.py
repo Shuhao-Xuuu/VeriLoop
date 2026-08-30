@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import json
 
-from .model import ModelClient, ModelClientError
+from .context import ContextPolicy
+from .model import ModelClient, ModelClientError, ModelProtocolError
 from .protocol import (
     AgentError,
     AgentResult,
@@ -48,6 +49,7 @@ class AgentLoop:
         max_steps: int = 12,
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         verification_gate: VerificationGate | None = None,
+        context_policy: ContextPolicy | None = None,
     ) -> None:
         if max_steps < 0:
             raise ValueError("max_steps must be non-negative")
@@ -56,6 +58,7 @@ class AgentLoop:
         self._max_steps = max_steps
         self._system_prompt = system_prompt
         self._verification_gate = verification_gate
+        self._context_policy = context_policy or ContextPolicy()
 
     def run(self, task: str) -> AgentResult:
         state = AgentState.INITIALIZING
@@ -153,12 +156,41 @@ class AgentLoop:
                 )
 
             transition(AgentState.THINKING)
+            try:
+                visible_history = self._context_policy.project(history)
+            except KeyboardInterrupt:
+                transition(AgentState.CANCELLED)
+                return finish(
+                    "",
+                    error=AgentError(
+                        kind=ErrorKind.CANCELLED,
+                        message="agent run cancelled during context projection",
+                    ),
+                )
+            except Exception as exc:
+                transition(AgentState.FAILED)
+                return finish(
+                    "",
+                    error=AgentError(
+                        kind=ErrorKind.INTERNAL_ERROR,
+                        message=(
+                            "unexpected context projection error: "
+                            f"{type(exc).__name__}: {exc}"
+                        ),
+                    ),
+                )
+
             step_count += 1
             try:
                 response = self._model.complete(
-                    list(history),
+                    visible_history,
                     self._tools.schemas(),
                 )
+                call_ids = tuple(call.id for call in response.tool_calls)
+                if len(set(call_ids)) != len(call_ids):
+                    raise ModelProtocolError(
+                        "model response contains duplicate tool call ids"
+                    )
             except KeyboardInterrupt:
                 transition(AgentState.CANCELLED)
                 return finish(
