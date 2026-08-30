@@ -3,7 +3,12 @@ from __future__ import annotations
 import pytest
 
 from veriloop.protocol import ErrorKind, ToolCall
-from veriloop.tools import ToolExecutionError, ToolRegistry, ToolSpec
+from veriloop.tools import (
+    ToolExecutionError,
+    ToolRegistry,
+    ToolSpec,
+    register_completion_tool,
+)
 
 
 def schema(**properties: dict[str, str]) -> dict[str, object]:
@@ -248,3 +253,30 @@ def test_registry_preserves_host_reported_mutation_on_expected_failure() -> None
 
     assert result.ok is False
     assert result.invalidates_verification is True
+
+
+def test_complete_task_schema_rejects_model_supplied_verification_fields() -> None:
+    registry = ToolRegistry()
+    register_completion_tool(registry)
+    schema = registry.schemas()[0]["function"]["parameters"]
+
+    valid = registry.execute(
+        ToolCall(
+            id="valid",
+            name="complete_task",
+            arguments={"summary": "implemented", "remaining_risks": "none"},
+        )
+    )
+    forged = registry.execute(
+        ToolCall(
+            id="forged",
+            name="complete_task",
+            arguments={"summary": "implemented", "verified": True},
+        )
+    )
+
+    assert schema["additionalProperties"] is False
+    assert set(schema["properties"]) == {"summary", "remaining_risks"}
+    assert valid.ok is True
+    assert valid.invalidates_verification is False
+    assert forged.error_kind is ErrorKind.INVALID_ARGUMENTS

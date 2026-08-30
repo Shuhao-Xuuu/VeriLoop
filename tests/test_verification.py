@@ -17,6 +17,7 @@ from veriloop.protocol import (
     ModelResponse,
     ProtectedChangeKind,
     ProtectedFileChange,
+    Role,
     VerificationCommandResult,
     VerificationPhase,
     VerificationResult,
@@ -88,6 +89,16 @@ def execute_file_tool(
     arguments: dict[str, object],
 ):
     return registry.execute(ToolCall(id=f"{name}-call", name=name, arguments=arguments))
+
+
+def verification_stack(workspace: Path, config_text: str):
+    write_config(workspace, config_text)
+    base_guard, _, spec = loaded_components(workspace)
+    guarded = protected_guard_for_spec(base_guard, spec)
+    runner = CommandRunner(guarded, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guarded, runner)
+    return registry, VerificationGate(spec, runner)
 
 
 def test_verification_protocol_exposes_explicit_terminal_states_and_errors() -> None:
@@ -1128,3 +1139,276 @@ argv = ["python", "verify.py"]
     assert result.commands[0].exit_code == 0
     assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
     assert result.verified_seq is None
+
+
+def test_complete_task_without_commands_finishes_unverified_with_paired_result(
+    tmp_path: Path,
+) -> None:
+    base_guard, _, spec = loaded_components(tmp_path)
+    guarded = protected_guard_for_spec(base_guard, spec)
+    runner = CommandRunner(guarded, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guarded, runner)
+    completion = ToolCall(
+        id="complete-no-config",
+        name="complete_task",
+        arguments={"summary": "implemented", "remaining_risks": "not verified"},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(completion)]),
+        registry,
+        verification_gate=VerificationGate(spec, runner),
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.final_message == "implemented"
+    assert result.verified_seq is None
+    assert result.tool_call_count == 1
+    tool_result = result.history[-1].tool_result
+    assert tool_result is not None
+    assert tool_result.call_id == "complete-no-config"
+    assert tool_result.ok is True
+    evidence = json.loads(tool_result.content)
+    assert evidence["verified"] is False
+    assert "no verification commands" in evidence["message"]
+
+
+def test_complete_task_green_gate_is_the_only_path_to_verified(tmp_path: Path) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    completion = ToolCall(
+        id="complete-green",
+        name="complete_task",
+        arguments={"summary": "fixed"},
+    )
+    model = ScriptedModel([tool_response(completion), final_response("must not run")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFIED
+    assert result.final_message == "fixed"
+    assert result.final_verification is not None
+    assert result.final_verification.passed is True
+    assert result.verified_seq == result.mutation_seq == 0
+    assert model.call_count == 1
+    assert result.tool_call_count == 1
+    tool_result = result.history[-1].tool_result
+    assert tool_result is not None
+    assert tool_result.call_id == "complete-green"
+    assert tool_result.ok is True
+    assert json.loads(tool_result.content)["verified"] is True
+    assert AgentState.VERIFYING in result.state_history
+    assert result.state_history[-1] is AgentState.VERIFIED
+
+
+def test_complete_task_failed_gate_terminates_truthfully(tmp_path: Path) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(4)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 0
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    completion = ToolCall(
+        id="complete-red",
+        name="complete_task",
+        arguments={"summary": "attempted"},
+    )
+    model = ScriptedModel([tool_response(completion), final_response("must not run")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFICATION_FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.VERIFICATION_FAILED
+    assert result.verified_seq is None
+    assert model.call_count == 1
+    tool_result = result.history[-1].tool_result
+    assert tool_result is not None
+    assert tool_result.call_id == "complete-red"
+    assert tool_result.ok is False
+    assert tool_result.error_kind is ErrorKind.VERIFICATION_FAILED
+    assert json.loads(tool_result.content)["commands"][0]["exit_code"] == 4
+
+
+def test_mixed_complete_task_response_executes_no_calls_and_pairs_every_id(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "value.txt"
+    original = b"value = 1\n"
+    target.write_bytes(original)
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "compileall", "-q", "."]
+""",
+    )
+    edit = ToolCall(
+        id="mixed-edit",
+        name="edit_file",
+        arguments={
+            "path": "value.txt",
+            "old_text": "value = 1",
+            "new_text": "value = 2",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    completion = ToolCall(
+        id="mixed-complete",
+        name="complete_task",
+        arguments={"summary": "done"},
+    )
+    model = ScriptedModel(
+        [tool_response(edit, completion), final_response("replanned")]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.final_message == "replanned"
+    assert result.mutation_seq == 0
+    assert target.read_bytes() == original
+    mixed_results = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+    ]
+    assert [item.call_id for item in mixed_results] == [
+        "mixed-edit",
+        "mixed-complete",
+    ]
+    assert [item.error_kind for item in mixed_results] == [
+        ErrorKind.DEFERRED_REPLAN_REQUIRED,
+        ErrorKind.COMPLETION_MUST_BE_SINGLE_CALL,
+    ]
+    assert model.call_count == 2
+    assert len(
+        [message for message in model.calls[1][0] if message.role is Role.TOOL]
+    ) == 2
+
+
+def test_two_complete_task_calls_are_both_rejected_as_non_unique(
+    tmp_path: Path,
+) -> None:
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        "[verification]\nbaseline_policy = \"skip\"\n",
+    )
+    calls = (
+        ToolCall(id="complete-one", name="complete_task", arguments={"summary": "one"}),
+        ToolCall(id="complete-two", name="complete_task", arguments={"summary": "two"}),
+    )
+    model = ScriptedModel([tool_response(*calls), final_response("replanned")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    paired = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+    ]
+    assert [item.call_id for item in paired] == ["complete-one", "complete-two"]
+    assert all(
+        item.error_kind is ErrorKind.COMPLETION_MUST_BE_SINGLE_CALL
+        for item in paired
+    )
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+
+
+def test_complete_task_forged_verified_argument_is_rejected_by_registry(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    forged = ToolCall(
+        id="forged",
+        name="complete_task",
+        arguments={"summary": "done", "verified": True},
+    )
+    model = ScriptedModel([tool_response(forged), final_response("VERIFIED")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.verified_seq is None
+    assert result.final_verification is None
+    assert model.call_count == 2
+    tool_result = next(
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+    )
+    assert tool_result.error_kind is ErrorKind.INVALID_ARGUMENTS
+
+
+def test_plain_final_claiming_verified_never_runs_gate(tmp_path: Path) -> None:
+    marker = tmp_path / "gate-ran"
+    (tmp_path / "verify.py").write_text(
+        "from pathlib import Path\nPath('gate-ran').write_text('yes')\n",
+        encoding="utf-8",
+    )
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+
+    result = AgentLoop(
+        ScriptedModel([final_response("tests passed, VERIFIED")]),
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.final_message == "tests passed, VERIFIED"
+    assert result.final_verification is None
+    assert result.verified_seq is None
+    assert not marker.exists()

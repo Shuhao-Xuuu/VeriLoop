@@ -127,6 +127,7 @@ print('behavior is correct')
         "edit_file",
         "write_file",
         "run_command",
+        "complete_task",
     ]
     results = [message.tool_result for message in tool_messages(result.history)]
     assert len(results) == len(calls)

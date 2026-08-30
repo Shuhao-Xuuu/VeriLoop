@@ -16,6 +16,7 @@ if TYPE_CHECKING:
 
 
 ToolHandler = Callable[[dict[str, Any]], Any]
+COMPLETE_TASK_TOOL_NAME = "complete_task"
 
 
 class ToolExecutionError(RuntimeError):
@@ -282,15 +283,43 @@ def register_process_tool(registry: ToolRegistry, runner: CommandRunner) -> None
     )
 
 
+def register_completion_tool(registry: ToolRegistry) -> None:
+    """Register the model's side-effect-free request for host acceptance."""
+
+    registry.register(
+        ToolSpec(
+            name=COMPLETE_TASK_TOOL_NAME,
+            description=(
+                "Request host verification after finishing the task. This tool does "
+                "not itself grant VERIFIED and must be called alone."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "summary": {"type": "string", "minLength": 1},
+                    "remaining_risks": {"type": "string"},
+                },
+                "required": ["summary"],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: {
+                "summary": arguments["summary"],
+                "remaining_risks": arguments.get("remaining_risks", ""),
+            },
+        )
+    )
+
+
 def register_workspace_tools(
     registry: ToolRegistry,
     guard: WorkspaceGuard,
     runner: CommandRunner,
 ) -> None:
-    """Register every Milestone 2 production tool on an existing registry."""
+    """Register every production workspace and completion tool."""
 
     register_filesystem_tools(registry, guard)
     register_process_tool(registry, runner)
+    register_completion_tool(registry)
 
 
 def build_workspace_tools(
@@ -338,6 +367,25 @@ def _tool_failure(
         retryable=retryable,
         metadata=details,
         invalidates_verification=invalidates_verification,
+    )
+
+
+def make_tool_failure(
+    call: ToolCall,
+    kind: ErrorKind,
+    message: str,
+    *,
+    retryable: bool = False,
+    metadata: dict[str, Any] | None = None,
+) -> ToolResult:
+    """Create a paired host protocol failure without invoking a handler."""
+
+    return _tool_failure(
+        call,
+        kind,
+        message,
+        retryable=retryable,
+        metadata=metadata,
     )
 
 
