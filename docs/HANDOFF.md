@@ -1,16 +1,27 @@
-# VeriLoop Milestone 2 implementation handoff
+# VeriLoop Milestone 3 implementation handoff
 
 This guide is for learning and defending the implementation. Milestone 1 was
-independently reviewed and remains intact; Milestone 2 adds real local tools
-without changing who owns the loop or how termination works.
+independently reviewed and remains intact. Milestone 2 added real local tools
+without changing who owns the loop or how termination works, and its reviewed
+green commit is `038b6298bc67c95998ff7df21af96fd1d6d4f221`. Milestone 3 adds
+host-owned verification and evidence without replacing those foundations.
 
 ## Current state
 
-The harness now has provider-independent messages, bounded provider retry,
-validated tool calling, synchronous loop control, five guarded file tools, one
-allowlisted process tool, production CLI composition, and deterministic offline
-tests. It has no independent Verification Gate. A final model message still
-means only `COMPLETED_UNVERIFIED`.
+The harness now provides the complete intended local agent loop:
+provider-independent messages, bounded provider retry, validated tool calling,
+synchronous loop control, five guarded file tools, one allowlisted process tool,
+an explicit `complete_task` request, a host-owned `VerificationGate`, bounded
+repair, deterministic context projection, redacted JSONL evidence, structured
+result artifacts, and read-only replay. Every model tool that is actually
+executed still passes through `ToolRegistry`; mixed completion responses are
+rejected by `AgentLoop` before any handler runs while preserving call/result
+pairing.
+
+The model can request acceptance but cannot grant it. Ordinary final text is
+always `COMPLETED_UNVERIFIED`, as is `complete_task` when there are no configured
+verification commands. Only a successful final Gate result can produce
+`VERIFIED`.
 
 ## Milestone 1 knowledge that still governs the system
 
@@ -30,24 +41,41 @@ calls. The loop checks before each model call, so it never makes request N+1.
 Model errors end `FAILED`, exhaustion ends `MAX_STEPS`, interruption ends
 `CANCELLED`, and ordinary final text ends `COMPLETED_UNVERIFIED`.
 
-## End-to-end Milestone 2 composition
+## End-to-end production composition
 
-`cli.main` parses the task, model configuration, workspace, and model-step
-limit. It reads `OPENAI_API_KEY` only after argument parsing, so `--help` works
-without a key. It then constructs:
+`cli.main` accepts both `veriloop <task>` and `veriloop run <task>`. It handles
+`veriloop replay <run-dir-or-events.jsonl>` before reading any provider key or
+constructing runtime components. Normal run parses the task, model
+configuration, workspace, step limit, and workspace-relative verification
+configuration. It reads `OPENAI_API_KEY` only after argument parsing, so
+`--help` works without a key.
 
-1. canonical `WorkspaceGuard`;
-2. `CommandPolicy`;
-3. `CommandRunner` bound to that guard and policy;
-4. `ToolRegistry` populated by `register_workspace_tools`;
-5. `OpenAICompatibleModel`;
-6. the unchanged `AgentLoop`.
+Normal run then constructs, in order:
+
+1. a canonical base `WorkspaceGuard` and `CommandPolicy`;
+2. a provider-safe frozen child environment and configuration `CommandRunner`;
+3. an immutable `VerificationSpec` loaded before the first model request;
+4. a model-facing guard containing the frozen protected write policy;
+5. a `CommandRunner` bound to that protected guard and the existing policy;
+6. a `VerificationGate`, which records the initial protected manifest;
+7. a `ToolRegistry` populated by `register_workspace_tools`;
+8. `OpenAICompatibleModel`;
+9. `TraceWriter` and `ContextPolicy`;
+10. `AgentLoop` with those host-owned components injected.
+
+The model is initialized before the trace directory is created, so a model
+constructor failure does not leave an empty run. Once the loop starts, baseline
+verification occurs before its first model request.
 
 The complete runtime path is:
 
 ```text
 CLI
+ -> load/freeze VerificationSpec
+ -> protected manifest / protected WorkspaceGuard
+ -> optional baseline verification
  -> AgentLoop
+ -> ContextPolicy
  -> ModelClient
  -> ToolRegistry
  -> WorkspaceGuard / CommandPolicy
@@ -55,14 +83,21 @@ CLI
  -> ToolResult
  -> history
  -> ModelClient
+ -> complete_task
+ -> VerificationGate
+    -> VERIFIED / RECOVERING / STALLED / VERIFICATION_FAILED
+ -> TraceWriter
+ -> result.json / optional patch.diff
 ```
 
-`build_workspace_tools` provides the same production registry construction for
-tests or embedding. Neither registration path creates a dependency framework.
+`build_workspace_tools` still provides production registry construction for
+tests or embedding. The verified CLI deliberately performs the more explicit
+composition above so the same frozen spec controls the protected guard, Gate,
+trace artifact runner, and loop. Neither path creates a dependency framework.
 
 ## Every production tool entry
 
-All schemas and bindings live in `src/veriloop/tools.py`.
+All seven schemas and bindings live in `src/veriloop/tools.py`.
 
 - `list_files` binds `filesystem.list_files(guard, **arguments)`. It is read-only
   and exposes path/depth/result limits with no extra properties.
@@ -77,6 +112,10 @@ All schemas and bindings live in `src/veriloop/tools.py`.
   mode to create/overwrite with a nullable digest.
 - `run_command` binds the callable `CommandRunner`. Its schema accepts only an
   argv array, relative cwd, and bounded integer timeout.
+- `complete_task` has only a required non-empty `summary` and optional
+  `remaining_risks`, rejects additional properties, and is side-effect-free in
+  the registry. It requests host acceptance; it cannot set verification fields
+  or grant `VERIFIED`.
 
 `ToolExecutionError` is the common expected-failure channel. A handler supplies
 an `ErrorKind`, safe message, retryability, and bounded details. The registry
@@ -240,7 +279,7 @@ The real bug-fix integration trajectory proves this: the first local check exits
 file, the second check exits 0, and the final state is still
 `COMPLETED_UNVERIFIED`.
 
-## Behavior-to-test map
+## Milestone 2 behavior-to-test map
 
 | Behavior | Test location |
 | --- | --- |
@@ -284,30 +323,319 @@ non-Windows hosts. Windows reparse points are treated as link-like when the
 standard-library stat flag exposes them. Platform-specific permission semantics
 remain limited to what `os.chmod`/`os.replace` provide.
 
-## No Verification Gate yet
+## Frozen verification configuration
 
-No completion tool, baseline/final verification, mutation sequence, freshness,
-repair round, trace writer, replay, or rollback exists. Running pytest through
-`run_command` can help the model decide what to do, but the Harness has not
-independently selected or enforced acceptance. No code path can produce
-`VERIFIED`.
+`src/veriloop/verification.py` owns `BaselinePolicy`,
+`VerificationCommandSpec`, and `VerificationSpec`. The specification is a
+frozen dataclass whose commands and protected globs are tuples, so no model turn
+can mutate the in-memory policy.
+
+`load_verification_spec` resolves one workspace-relative TOML path through the
+base `WorkspaceGuard`, rejects links, oversized or non-UTF-8 input, unknown
+fields, invalid types, unsafe cwd values, excessive timeouts, and commands
+rejected by the existing `CommandPolicy`. It checks both decoded TOML text and
+the parsed document for the known provider credential before those values reach
+policy or tool execution. It then copies validated data into immutable protocol
+values. Later edits to the TOML file cannot change the current run.
+
+A missing configuration freezes an empty command set rather than preventing the
+agent from running. The requested config path is still retained, protected from
+model writes, and represented as missing in the manifest so later creation is
+detectable. Empty commands can never grant `VERIFIED`.
+
+## Baseline before model execution
+
+`VerificationGate.run_baseline` implements three policies, and `AgentLoop.run`
+invokes it before the first context projection or model request:
+
+- `must_fail` requires every command to start without timeout and at least one
+  nonzero exit. An all-zero baseline is `BASELINE_UNEXPECTED_PASS` and ends
+  `FAILED`; it is not evidence of a repair.
+- `record_only` records zero or nonzero exits and continues, but a start error or
+  timeout is still a baseline infrastructure failure.
+- `skip` starts no commands and records an explicit skipped baseline.
+
+An empty command set is also represented as a skipped baseline. Baseline
+commands are Gate operations, not model tool calls, and therefore do not advance
+`mutation_seq`. Baseline evidence is copied into `AgentResult`, JSONL trace,
+`result.json`, and the CLI summary.
+
+## Completion request and host-owned final verification
+
+`register_completion_tool` registers `complete_task` in the same production
+`ToolRegistry` as every other tool. Registry execution performs ordinary schema
+validation and returns the request values, but does not invoke the Gate and does
+not set state. `AgentLoop` recognizes the validated request and owns the
+completion protocol:
+
+1. ordinary final model text immediately becomes `COMPLETED_UNVERIFIED` and
+   never runs final verification;
+2. `complete_task` with no frozen commands returns a paired, successful request
+   result whose `verified` field is false, then ends `COMPLETED_UNVERIFIED`;
+3. with commands configured, the loop enters `VERIFYING` and calls
+   `VerificationGate.run_final`;
+4. only `VerificationGate.grants_verified` can move the loop to `VERIFIED`.
+
+The Gate runs every frozen command in order through the existing
+`CommandRunner`. A grant requires a final-phase result, a non-empty command set,
+one result per configured command, every command started, no timeout, every exit
+code equal to zero, unchanged protected inputs, and
+`result.verified_seq == result.mutation_seq`, with both equal to the loop's
+current `mutation_seq`.
+
+The model cannot forge this outcome in text, tool arguments, or tool-result
+metadata. `complete_task` rejects extra properties such as `verified`, `state`,
+or `exit_code`. A model-initiated `run_command` that runs pytest successfully is
+only a tool observation and invalidates prior verification; it does not set
+`verified_seq`.
+
+## Mixed completion calls
+
+`complete_task` must be the only call in one assistant response. If it appears
+with any other call, AgentLoop executes none of them. It still appends exactly
+one `ToolResult` for every original call ID in original order:
+
+- each `complete_task` receives `COMPLETION_MUST_BE_SINGLE_CALL`;
+- each other call receives `DEFERRED_REPLAN_REQUIRED`.
+
+The paired failures enter canonical history and the next model request can
+replan. This preserves the Milestone 1 pairing invariant without allowing a
+write or process side effect to occur beside a completion request.
+
+## Protected manifest and write policy
+
+`VerificationGate.__init__` builds the initial manifest before the model first
+receives execution permission. `build_protected_manifest` deterministically
+enumerates paths matched by the frozen `protected_globs`, does not follow
+link-like entries, skips host metadata/cache directories, and always adds the
+configuration path. Each record contains the relative path, existence, file
+kind, size, and SHA-256 when meaningful.
+
+`compare_protected_manifests` emits only stable relative-path evidence for
+created, deleted, modified, or replaced entries. Final verification compares
+both before and after running commands, so it detects a change that existed
+before the Gate as well as one caused by a verification command. Any change
+wins over green command exits and produces `PROTECTED_FILE_CHANGED`.
+
+`protected_guard_for_spec` also copies the frozen globs and exact config path
+into the model-facing `WorkspaceGuard`, so `edit_file` and both `write_file`
+modes reject direct protected writes. This is defense in depth, not a substitute
+for the final manifest: allowed workspace code launched through `run_command`
+can still modify files outside the file-tool API.
+
+`.veriloop/**` is host-owned trace metadata and is excluded from protected
+wildcard enumeration, preventing evidence written by the Harness from creating
+a false protected-file failure.
+
+## Mutation and verification freshness
+
+AgentLoop starts with `mutation_seq = 0` and `verified_seq = None`.
+`ToolRegistry` marks successful mutating tool results with
+`invalidates_verification`; expected command failures can carry the same flag
+when a process really started. The loop advances `mutation_seq` and clears
+`verified_seq` for:
+
+- successful `edit_file`;
+- successful `write_file` create or overwrite;
+- a model-requested `run_command` that started, whether it exits zero, exits
+  nonzero, or times out.
+
+Reads, searches, listings, unknown tools, invalid arguments, denied commands,
+process start errors, failed file changes, `complete_task`, and Gate-owned
+baseline/final commands do not advance the sequence. A successful final Gate
+sets `verified_seq` to the exact revision it observed. Consequently stale green
+evidence cannot survive a later mutation.
+
+`changed_files` is deliberately narrower than mutation tracking: it is a sorted
+summary of paths reported by successful `edit_file` and `write_file` calls. It
+does not pretend to enumerate unknown process side effects.
+
+## Repair rounds and repeated failures
+
+A repair round is consumed only when one failed final verification is returned
+to the model as a retryable `complete_task` result and the loop continues in
+`RECOVERING`. Therefore `max_repair_rounds = N` permits at most `1 + N` final
+verification attempts. Once the budget is exhausted, the last evidence is
+paired into history, state becomes `VERIFICATION_FAILED`, and no extra model
+request occurs.
+
+Before spending another repair round, the loop counts consecutive equal failure
+signatures. Reaching `max_same_failure` ends `STALLED`, even if repair budget
+remains. A materially different signature resets the consecutive count; a
+missing signature cannot accidentally trigger stalling.
+
+`_failure_signature` hashes deterministic JSON containing failure kind, command
+argv/cwd, start/timeout/exit/error facts, normalized stdout/stderr tails, and
+sorted path-only protected changes. It excludes duration and normalizes
+workspace/temp paths, timestamps, process IDs, run IDs, elapsed values, and
+random temporary path components. This makes repeated substantive failures
+stable without storing full output.
+
+If the model emits plain final text while recovering, it still ends
+`COMPLETED_UNVERIFIED`; the last failed verification remains in the result as
+evidence.
+
+## Deterministic context projection
+
+`ContextPolicy.project` operates on provider-independent `Message` objects and
+never mutates canonical history. System and initial user messages are permanent
+anchors. Every later assistant message plus all of its ordered tool results is
+one atomic group. The policy removes the oldest removable whole group first,
+retains a configurable number of recent groups, and pins the most recent
+verification-failure group.
+
+If retained content still exceeds the soft character limit, bounded head/tail
+previews are made on a deep copy. Assistant/tool pairing, call IDs, ordering, and
+the canonical history remain intact. Malformed or orphaned groups fail before a
+provider request rather than being projected into an invalid message sequence.
+
+## Redacted JSONL trace
+
+`TraceWriter` creates one exclusive run directory under
+`.veriloop/runs/<run-id>/` and writes one flushed JSON object per event. Each
+event contains `schema_version`, strictly increasing `seq` starting at 1, UTC
+`timestamp`, `run_id`, `event_type`, current `state`, and a bounded `payload`.
+The event vocabulary covers run start/finish/failure/cancellation, baseline,
+state transitions, model requests/responses, provider retries, tool receipt and
+execution, workspace revision changes, completion, final verification, and
+recovery.
+
+Trace payloads contain summaries rather than hidden reasoning or unrestricted
+content. Write arguments are represented by lengths and digests; command and
+verification streams use bounded previews. Exact known secrets and obvious
+Authorization Bearer values are redacted before preview truncation, including
+when a secret crosses the old preview boundary. Forbidden environment, header,
+provider-client, and reasoning keys are discarded.
+
+The provider API key is host data: it is used for exact in-memory rejection and
+redaction but is not passed to `ToolRegistry`, tool handlers, policy, Gate, or
+child processes. The CLI freezes a minimal child environment and removes both
+sensitive names and allowed variables whose values contain a discovered
+provider secret. Redaction reduces accidental disclosure risk; it is not a
+general DLP guarantee.
+
+A trace write failure closes tracing but does not fabricate a different agent
+state or freshness result.
+
+## `result.json` and optional `patch.diff`
+
+At termination, `TraceWriter.write_artifacts` derives `result.json` from the
+host-created `AgentResult`. It includes state, final text, step/tool counts,
+mutation and verified sequences, repair usage, baseline and final verification,
+protected and changed-file summaries, trace/result/patch paths, duration, model
+usage, and bounded error evidence. The model cannot supply its authoritative
+state.
+
+Artifacts use exclusive, same-directory atomic installation and never
+overwrite an existing target. The same redactor and collection bounds apply to
+events, result, and patch data.
+
+`patch.diff` is optional. The writer uses the existing `CommandRunner` for only
+`git rev-parse --is-inside-work-tree` and a bounded working-tree `git diff`.
+There is no commit, checkout, restore, reset, or history mutation. A non-Git
+workspace, unavailable Git, failed or truncated diff, no changes, or an artifact
+write failure is recorded as patch metadata instead of producing invented
+content or changing the Agent result. Ordinary `git diff -- .` does not include
+untracked files.
+
+## Read-only replay
+
+`replay_trace` accepts a run directory or `events.jsonl`, reads it as bounded
+UTF-8 JSONL, validates JSON value shapes, schema version, sequential `seq`, one
+stable run ID, event/state vocabulary, and event-specific payload facts, then
+renders a concise allowlisted view in order.
+
+Replay does not read provider credentials and never constructs a model,
+`ToolRegistry`, `CommandRunner`, or `TraceWriter`. It cannot execute a tool,
+apply a patch, resume a session, or write workspace files. Corrupt or oversized
+input produces a clear parser error and no other behavior.
+
+## CLI evidence and terminal semantics
+
+Normal CLI output gives the terminal state, bounded baseline and final
+verification summaries, changed files, trace/result/patch paths, final message,
+and error evidence. It never renders hidden reasoning. `--help` and replay are
+key-free; configuration and provider setup errors are bounded and redacted.
+
+Only `VERIFIED` returns exit code zero for a normal run. Every other run state,
+including `COMPLETED_UNVERIFIED`, returns one. Successful replay returns zero;
+argparse, setup, or corrupt-replay errors return two.
+
+## Trust boundary and known limits
+
+VeriLoop is not an OS sandbox and is not described as production-ready or
+absolutely safe. `WorkspaceGuard` and `CommandPolicy` constrain Harness-owned
+interfaces, but an allowed in-workspace Python script or test suite is repository
+code and can attempt external file or network access. Run only in a trusted or
+disposable workspace.
+
+On POSIX, timeout cleanup targets a process group. On Windows, direct-child
+cleanup is reliable while arbitrary descendants remain best effort. Trace
+redaction cannot recognize every possible secret encoding. The project has no
+multi-Agent execution, parallel tools, streaming, session resume, automatic
+rollback, OS sandbox, or automatic Git commit/push facility.
+
+Milestone 3 is the final core feature milestone. The project is now in feature
+freeze; subsequent work is limited to bug fixes, tests, documentation, and
+release work.
+
+## Milestone 3 behavior-to-test map
+
+| Behavior | Test location |
+| --- | --- |
+| Frozen valid, missing, changed-on-disk, invalid, unsafe, and secret-bearing configuration | opening configuration tests in `tests/test_verification.py` |
+| `must_fail`, `record_only`, `skip`, timeout/start errors, and frozen command order | `test_baseline_*` in `tests/test_verification.py` |
+| Modified/deleted/created/replaced protected paths, automatic config protection, and file-tool write denial | protected-manifest and protected-tool tests in `tests/test_verification.py` |
+| Read-only tools, successful/failed file changes, started/non-started commands, timeout, and proactive pytest freshness | mutation-sequence tests in `tests/test_verification.py` |
+| Final Gate success, command failure, timeout, start error, protected changes, and frozen commands | `test_final_gate_*` in `tests/test_verification.py` |
+| Completion without commands, green completion, forged arguments, plain final, and mixed calls | `test_complete_task_*`, `test_mixed_complete_task_*`, and `test_plain_final_*` in `tests/test_verification.py` |
+| Repair evidence visibility, exact attempt budget, recovery plain final, repeated signatures, and counter reset | repair and failure-signature tests in `tests/test_verification.py` |
+| Atomic context groups, recent/failure retention, deterministic copying, bounded projection, and malformed pairing | `tests/test_context.py` |
+| Append-only events, lifecycle, bounded summaries, redaction-before-truncation, retries, trace failure, artifacts, and patch races | `tests/test_trace.py` |
+| Strict, bounded, side-effect-free trace loading and formatting | `tests/test_replay.py` |
+| Key-free help/replay, config ordering, protected composition, secret boundary, CLI evidence, and exit codes | `tests/test_cli.py` |
+| Production Red-to-Green Gate success | `test_red_green_project_is_verified_by_the_production_gate` in `tests/test_agent_verification_integration.py` |
+| Failed verification followed by repair and VERIFIED | `test_failed_verification_evidence_drives_repair_to_verified` in the same integration file |
+| Persistent failure stopping at the exact budget | `test_persistent_failure_stops_at_the_exact_repair_budget` in the same integration file |
+| Command-side protected test tampering cannot verify | `test_started_command_tampering_with_protected_test_cannot_verify` in the same integration file |
+| Plain final cannot run the configured Gate | `test_plain_final_claim_never_runs_the_configured_gate` in the same integration file |
 
 ## Recommended code-reading order
 
-1. `src/veriloop/protocol.py`: immutable values and M2 `ErrorKind` additions.
-2. `src/veriloop/tools.py`: schema validation, expected failure conversion, and
-   all production registrations.
-3. `src/veriloop/filesystem.py::WorkspaceGuard`: lexical/canonical containment
-   and protected paths.
-4. `src/veriloop/filesystem.py::read_file`, `edit_file`, and `_atomic_replace`:
-   trace byte SHA through deterministic mutation.
-5. `src/veriloop/filesystem.py::list_files` and `search_text`: trace sorted,
-   bounded, non-symlink traversal.
-6. `src/veriloop/process.py::CommandPolicy`: understand every allow/deny shape.
-7. `src/veriloop/process.py::CommandRunner`, `_terminate_process`, and
-   `_output_preview`: trace child lifecycle and bounded return data.
-8. `src/veriloop/agent.py::AgentLoop.run`: verify it remains ignorant of every
-   concrete local tool and still only returns `COMPLETED_UNVERIFIED` on text.
+1. `src/veriloop/protocol.py`: follow provider-independent messages, states,
+   verification evidence, and the authoritative `AgentResult`.
+2. `src/veriloop/model.py::OpenAICompatibleModel`: confirm provider conversion
+   and retry end before data enters the loop.
+3. `src/veriloop/tools.py::ToolRegistry` and production registrations: trace
+   schema validation, call/result pairing, mutation flags, and `complete_task`.
+4. `src/veriloop/filesystem.py::WorkspaceGuard`: understand lexical/canonical
+   containment, metadata protection, and frozen protected-write checks.
+5. `src/veriloop/filesystem.py::read_file`, `edit_file`, `write_file`, and
+   `_atomic_replace`: trace raw-byte SHA and no-clobber mutation.
+6. `src/veriloop/process.py::CommandPolicy`, `CommandRunner`, and
+   `host_child_environment`: trace allowlisting, child lifecycle, bounded output,
+   and provider-secret removal.
+7. `src/veriloop/verification.py::load_verification_spec`: follow TOML bytes
+   into validated immutable values before the model exists.
+8. `src/veriloop/verification.py::build_protected_manifest`,
+   `compare_protected_manifests`, and `protected_guard_for_spec`: understand the
+   two protected-input defenses.
+9. `src/veriloop/verification.py::VerificationGate`: compare baseline policy,
+   final evidence, and every `grants_verified` conjunct.
+10. `src/veriloop/agent.py::AgentLoop.run`: follow baseline, projected requests,
+    mixed-call handling, mutation invalidation, completion, repair, stall, and
+    terminal artifact truth without direct file or subprocess access.
+11. `src/veriloop/context.py::ContextPolicy`: trace atomic group partitioning,
+    deterministic removal, failure retention, and projection-only truncation.
+12. `src/veriloop/trace.py::Redactor` and `TraceWriter.emit`: inspect
+    redaction-before-truncation and the append-only event envelope.
+13. `src/veriloop/trace.py::TraceWriter.write_artifacts` and `_result_payload`:
+    trace host result serialization and optional read-only Git diff generation.
+14. `src/veriloop/trace.py::load_trace_events`, `format_trace_replay`, and
+    `replay_trace`: verify the bounded read-only evidence path.
+15. `src/veriloop/cli.py::main`: confirm configuration precedes the model,
+    protected components share one frozen spec, secrets stop at host boundaries,
+    and only `VERIFIED` exits zero.
 
 ## Milestone 1 questions that remain mandatory
 
@@ -344,3 +672,36 @@ independently selected or enforced acceptance. No code path can produce
    pytest from outside files or the network?
 10. How do the two full integration trajectories prove that real tool failure is
     visible to the next model turn without adding any Milestone 3 verification?
+
+## 项目作者必须掌握的 Milestone 3 问题
+
+1. `VerificationSpec` 在 CLI 的什么位置加载，哪些不可变类型使磁盘配置在
+   run 中无法漂移，为什么这必须发生在第一次模型请求之前？
+2. `must_fail`、`record_only` 和 `skip` 对非零退出、全零退出、timeout 与
+   start error 分别如何解释，为什么 timeout 不能作为有效 Red 证据？
+3. `VerificationGate.grants_verified` 的每个合取条件是什么，缺失任一条件时
+   为什么都不能用 `VERIFIED` 表示结果？
+4. 为什么 `complete_task` 必须先经过普通 `ToolRegistry` schema 验证，却又
+   不能由它的 handler 直接授予状态？
+5. 同轮出现 `complete_task` 与其他调用时，为何所有调用都不执行但仍必须按
+   原顺序为每个 call ID 产生恰好一个结果？
+6. 哪些普通工具结果会推进 `mutation_seq`，为什么已启动但 nonzero 或 timeout
+   的 `run_command` 也必须使旧验证失效？
+7. 为什么 Gate 自己的 baseline/final command 不推进 `mutation_seq`，以及
+   `verified_seq == mutation_seq` 如何证明 green evidence 的 freshness？
+8. protected write deny 与 final manifest 各自阻止什么攻击面，为什么只有文件
+   工具层面的 deny 仍不足以保护 tests 和配置？
+9. `max_repair_rounds = N` 为什么对应最多 `1 + N` 次 final verification，在哪个
+   精确时刻 repair round 才算被消耗？
+10. failure signature 包含和排除哪些字段，如何标准化易变路径、时间和输出，
+    为什么 stall 只统计连续相同签名？
+11. ContextPolicy 如何定义一个不可拆分的 assistant/tool group，哪些 anchor 和
+    failure group 必须保留，为什么 canonical history 从不被裁剪？
+12. Trace 为什么必须先做 known-secret/Bearer redaction 再做 preview truncation，
+    哪些 payload 可以记录而哪些 provider、环境和推理数据必须丢弃？
+13. `result.json` 的 state 从哪里产生，为什么模型 summary、工具参数或 metadata
+    都不能成为 authoritative result？
+14. `patch.diff` 使用哪些只读 Git 命令，哪些失败会使其 unavailable，为什么这
+    不影响内存 AgentResult 的真假？
+15. replay 对 JSONL 做哪些协议和边界验证，哪些组件明确不会构造，什么测试
+    证明它不会重新执行任何副作用？

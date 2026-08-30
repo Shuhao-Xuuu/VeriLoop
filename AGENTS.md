@@ -23,5 +23,16 @@
   not add direct file or subprocess access to `AgentLoop`.
 - The tool execution layer must never receive provider secrets. A prompt is not
   a substitute for host-side path, command, or environment checks.
+- Only the host `VerificationGate` may grant `VERIFIED`; model text, tool
+  arguments, and ordinary command results are never verification authority.
+- Load and freeze verification commands before the first model request. Every
+  model-side workspace mutation must invalidate older verification, while Gate
+  commands must not advance the model mutation sequence.
+- Replay is read-only evidence inspection. It must never call a model, execute a
+  tool or command, apply a patch, or otherwise modify the workspace.
+- Trace events, `result.json`, and `patch.diff` must never persist provider
+  secrets.
 - Do not amend, replace, or otherwise rewrite the reviewed Milestone 1 or
   Milestone 2 commit history.
+- Milestone 3 completion starts feature freeze. Subsequent work is limited to
+  bug fixes, tests, documentation, and release work until explicitly authorized.
