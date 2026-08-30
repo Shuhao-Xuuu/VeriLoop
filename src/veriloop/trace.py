@@ -8,6 +8,7 @@ from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -37,6 +38,12 @@ TRACE_GENERIC_STRING_CHARS = 4_096
 TRACE_MAX_COLLECTION_ITEMS = 100
 PATCH_DIFF_LIMIT_BYTES = DEFAULT_OUTPUT_LIMIT_BYTES
 PATCH_GIT_TIMEOUT_SECONDS = 30
+REPLAY_MAX_EVENTS = 10_000
+REPLAY_MAX_LINE_CHARS = 1_000_000
+REPLAY_MAX_TOTAL_CHARS = 16 * 1024 * 1024
+REPLAY_MAX_COMMANDS_PER_EVENT = TRACE_MAX_COLLECTION_ITEMS
+REPLAY_MAX_OUTPUT_CHARS = 8 * 1024 * 1024
+REPLAY_MAX_INTEGER_BITS = 4_096
 TRACE_TRUNCATION_MARKER = "...[veriloop trace truncated]..."
 REDACTION_MARKER = "[REDACTED]"
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -45,6 +52,29 @@ _AUTHORIZATION_BEARER = re.compile(
     r"[^\s,;\"']+"
 )
 _CONTENT_ARGUMENT_NAMES = frozenset({"content", "old_text", "new_text"})
+_REPLAY_EVENT_TYPES = frozenset(
+    {
+        "run_started",
+        "baseline_started",
+        "baseline_finished",
+        "state_changed",
+        "model_request_started",
+        "model_response_received",
+        "provider_retry",
+        "tool_call_received",
+        "tool_execution_started",
+        "tool_execution_finished",
+        "workspace_revision_changed",
+        "completion_requested",
+        "verification_started",
+        "verification_finished",
+        "recovery_started",
+        "run_finished",
+        "run_failed",
+        "run_cancelled",
+    }
+)
+_REPLAY_STATES = frozenset(state.value for state in AgentState)
 _FORBIDDEN_TRACE_KEYS = frozenset(
     {
         "authorization",
@@ -61,6 +91,10 @@ _FORBIDDEN_TRACE_KEYS = frozenset(
 
 class TraceError(RuntimeError):
     """The host could not establish or append a trustworthy trace."""
+
+
+class ReplayError(ValueError):
+    """A saved trace cannot be replayed as trustworthy read-only evidence."""
 
 
 class Redactor:
@@ -497,6 +531,528 @@ def history_summary(messages: Sequence[Message]) -> dict[str, Any]:
         "message_count": len(messages),
         "roles": [message.role.value for message in messages],
     }
+
+
+def load_trace_events(source: str | Path) -> tuple[dict[str, Any], ...]:
+    """Read and validate one JSONL trace without executing saved actions."""
+
+    path = Path(source)
+    try:
+        if path.is_dir():
+            path = path / "events.jsonl"
+        if not path.is_file():
+            raise ReplayError("replay source must be a run directory or JSONL file")
+        stream = path.open("r", encoding="utf-8", newline="")
+    except ReplayError:
+        raise
+    except (OSError, ValueError) as exc:
+        raise ReplayError("replay source cannot be opened") from exc
+
+    events: list[dict[str, Any]] = []
+    expected_seq = 1
+    expected_run_id: str | None = None
+    total_chars = 0
+    try:
+        with stream:
+            line_number = 0
+            while True:
+                line_number += 1
+                line = stream.readline(REPLAY_MAX_LINE_CHARS + 1)
+                if line == "":
+                    break
+                if len(line) > REPLAY_MAX_LINE_CHARS:
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} exceeds replay limit"
+                    )
+                total_chars += len(line)
+                if total_chars > REPLAY_MAX_TOTAL_CHARS:
+                    raise ReplayError("events.jsonl exceeds replay total size limit")
+                if len(events) >= REPLAY_MAX_EVENTS:
+                    raise ReplayError("events.jsonl exceeds replay event limit")
+                text = line.rstrip("\r\n")
+                if not text:
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} is empty"
+                    )
+                try:
+                    event = json.loads(
+                        text,
+                        parse_constant=_reject_json_constant,
+                    )
+                except (
+                    json.JSONDecodeError,
+                    OverflowError,
+                    RecursionError,
+                    ValueError,
+                ) as exc:
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} is not valid JSON"
+                    ) from exc
+                _validate_replay_event(
+                    event,
+                    line_number=line_number,
+                    expected_seq=expected_seq,
+                    expected_run_id=expected_run_id,
+                )
+                if expected_run_id is None:
+                    expected_run_id = event["run_id"]
+                events.append(event)
+                expected_seq += 1
+    except ReplayError:
+        raise
+    except (OSError, UnicodeError) as exc:
+        raise ReplayError("events.jsonl cannot be read as UTF-8") from exc
+
+    if not events:
+        raise ReplayError("events.jsonl contains no events")
+    return tuple(events)
+
+
+def format_trace_replay(events: Sequence[Mapping[str, Any]]) -> str:
+    """Format validated events using a small payload allowlist."""
+
+    if not events:
+        raise ReplayError("cannot format an empty trace")
+    if len(events) > REPLAY_MAX_EVENTS:
+        raise ReplayError("trace exceeds replay event limit")
+    expected_run_id: str | None = None
+    for index, event in enumerate(events, start=1):
+        _validate_replay_event(
+            event,
+            line_number=index,
+            expected_seq=index,
+            expected_run_id=expected_run_id,
+        )
+        if expected_run_id is None:
+            expected_run_id = event["run_id"]
+    run_id = _replay_label(events[0].get("run_id"))
+    lines: list[str] = []
+    output_chars = 0
+
+    def append_line(line: str) -> None:
+        nonlocal output_chars
+        output_chars += len(line) + (1 if lines else 0)
+        if output_chars > REPLAY_MAX_OUTPUT_CHARS:
+            raise ReplayError("formatted replay exceeds output limit")
+        lines.append(line)
+
+    append_line(f"run_id: {run_id}")
+    append_line(f"events: {len(events)}")
+    for event in events:
+        seq = event.get("seq")
+        event_type = _replay_label(event.get("event_type"))
+        state = _replay_label(event.get("state"))
+        payload_value = event.get("payload")
+        payload = payload_value if isinstance(payload_value, Mapping) else {}
+        details = _replay_event_details(event_type, payload)
+        line = f"{seq:04d} {event_type} state={state}"
+        if details:
+            line += " " + " ".join(details)
+        append_line(line)
+        commands = (
+            payload.get("commands")
+            if event_type in {"baseline_finished", "verification_finished"}
+            else None
+        )
+        if isinstance(commands, list):
+            for index, command in enumerate(commands, start=1):
+                append_line(
+                    "  command["
+                    f"{index}] exit_code={_replay_scalar(command.get('exit_code'))} "
+                    f"timed_out={_replay_scalar(command.get('timed_out'))} "
+                    f"started={_replay_scalar(command.get('started'))}"
+                )
+    return "\n".join(lines)
+
+
+def replay_trace(source: str | Path) -> str:
+    """Validate and format a trace without restoring or executing a session."""
+
+    return format_trace_replay(load_trace_events(source))
+
+
+def _validate_replay_event(
+    event: Any,
+    *,
+    line_number: int,
+    expected_seq: int,
+    expected_run_id: str | None,
+) -> None:
+    if not isinstance(event, dict):
+        raise ReplayError(f"events.jsonl line {line_number} must be an object")
+    _validate_replay_json_value(event, line_number=line_number)
+    required = {"seq", "timestamp", "run_id", "event_type", "state", "payload"}
+    missing = sorted(required - set(event))
+    if missing:
+        raise ReplayError(
+            f"events.jsonl line {line_number} is missing: {', '.join(missing)}"
+        )
+    seq = event["seq"]
+    if not isinstance(seq, int) or isinstance(seq, bool) or seq != expected_seq:
+        raise ReplayError(
+            f"events.jsonl line {line_number} expected seq {expected_seq}"
+        )
+    run_id = event["run_id"]
+    if not isinstance(run_id, str) or not _RUN_ID_PATTERN.fullmatch(run_id):
+        raise ReplayError(f"events.jsonl line {line_number} has invalid run_id")
+    if expected_run_id is not None and run_id != expected_run_id:
+        raise ReplayError(f"events.jsonl line {line_number} changes run_id")
+    timestamp = event["timestamp"]
+    if not isinstance(timestamp, str) or not timestamp:
+        raise ReplayError(f"events.jsonl line {line_number} has invalid timestamp")
+    event_type = event["event_type"]
+    if not isinstance(event_type, str) or event_type not in _REPLAY_EVENT_TYPES:
+        raise ReplayError(f"events.jsonl line {line_number} has invalid event_type")
+    state = event["state"]
+    if not isinstance(state, str) or state not in _REPLAY_STATES:
+        raise ReplayError(f"events.jsonl line {line_number} has invalid state")
+    if not isinstance(event["payload"], dict):
+        raise ReplayError(f"events.jsonl line {line_number} has invalid payload")
+    if "schema_version" in event:
+        schema_version = event["schema_version"]
+        if type(schema_version) is not int or schema_version != TRACE_SCHEMA_VERSION:
+            raise ReplayError(
+                f"events.jsonl line {line_number} has unsupported schema_version"
+            )
+    _validate_replay_payload(event, line_number=line_number)
+
+
+def _validate_replay_json_value(value: Any, *, line_number: int) -> None:
+    stack = [value]
+    seen_containers: set[int] = set()
+    while stack:
+        item = stack.pop()
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has a cyclic JSON value"
+                )
+            seen_containers.add(identity)
+            for key, child in item.items():
+                if not isinstance(key, str):
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} has a non-string JSON key"
+                    )
+                _validate_replay_text(key, line_number=line_number)
+                stack.append(child)
+            continue
+        if isinstance(item, list):
+            identity = id(item)
+            if identity in seen_containers:
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has a cyclic JSON value"
+                )
+            seen_containers.add(identity)
+            stack.extend(item)
+            continue
+        if isinstance(item, str):
+            _validate_replay_text(item, line_number=line_number)
+            continue
+        if isinstance(item, float) and not math.isfinite(item):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has a non-finite number"
+            )
+        if (
+            isinstance(item, int)
+            and not isinstance(item, bool)
+            and item.bit_length() > REPLAY_MAX_INTEGER_BITS
+        ):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has an oversized integer"
+            )
+        if item is None or isinstance(item, (bool, int, float)):
+            continue
+        raise ReplayError(
+            f"events.jsonl line {line_number} has an unsupported JSON value"
+        )
+
+
+def _validate_replay_text(value: str, *, line_number: int) -> None:
+    try:
+        value.encode("utf-8")
+    except UnicodeEncodeError as exc:
+        raise ReplayError(
+            f"events.jsonl line {line_number} contains invalid Unicode"
+        ) from exc
+
+
+def _validate_replay_payload(
+    event: Mapping[str, Any],
+    *,
+    line_number: int,
+) -> None:
+    event_type = event["event_type"]
+    payload = event["payload"]
+    if event_type == "state_changed":
+        from_state = _required_replay_text(payload, "from_state", line_number)
+        to_state = _required_replay_text(payload, "to_state", line_number)
+        if from_state not in _REPLAY_STATES or to_state not in _REPLAY_STATES:
+            raise ReplayError(
+                f"events.jsonl line {line_number} has invalid state transition"
+            )
+        if to_state != event["state"]:
+            raise ReplayError(
+                f"events.jsonl line {line_number} has inconsistent state transition"
+            )
+        return
+    if event_type in {
+        "tool_call_received",
+        "tool_execution_started",
+        "tool_execution_finished",
+    }:
+        _required_replay_text(payload, "tool_name", line_number)
+        _required_replay_text(payload, "call_id", line_number)
+        if event_type == "tool_execution_finished":
+            if "cancelled" in payload:
+                if payload["cancelled"] is not True:
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} has invalid cancelled"
+                    )
+                if "ok" in payload or "content" in payload:
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} has inconsistent tool result"
+                    )
+            elif not isinstance(payload.get("ok"), bool):
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has invalid ok"
+                )
+            content = payload.get("content")
+            if isinstance(content, Mapping) and "exit_code" in content:
+                exit_code = content["exit_code"]
+                if exit_code is not None and (
+                    not isinstance(exit_code, int) or isinstance(exit_code, bool)
+                ):
+                    raise ReplayError(
+                        f"events.jsonl line {line_number} has invalid exit_code"
+                    )
+        return
+    if event_type in {"baseline_finished", "verification_finished"}:
+        if "cancelled" in payload:
+            if payload["cancelled"] is not True:
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has invalid cancelled"
+                )
+            if any(
+                field in payload
+                for field in (
+                    "passed",
+                    "skipped",
+                    "failure_kind",
+                    "commands",
+                    "error_kind",
+                )
+            ):
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has inconsistent verification result"
+                )
+            return
+        if "passed" not in payload:
+            _required_replay_text(payload, "error_kind", line_number)
+            if any(
+                field in payload
+                for field in ("skipped", "failure_kind", "commands")
+            ):
+                raise ReplayError(
+                    f"events.jsonl line {line_number} has inconsistent verification result"
+                )
+            return
+        if not isinstance(payload.get("passed"), bool):
+            raise ReplayError(f"events.jsonl line {line_number} has invalid passed")
+        if not isinstance(payload.get("skipped"), bool):
+            raise ReplayError(f"events.jsonl line {line_number} has invalid skipped")
+        if "failure_kind" not in payload:
+            raise ReplayError(
+                f"events.jsonl line {line_number} has invalid failure_kind"
+            )
+        failure_kind = payload.get("failure_kind")
+        if failure_kind is not None and (
+            not isinstance(failure_kind, str) or not failure_kind
+        ):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has invalid failure_kind"
+            )
+        commands = payload.get("commands")
+        if not isinstance(commands, list):
+            raise ReplayError(f"events.jsonl line {line_number} has invalid commands")
+        if len(commands) > REPLAY_MAX_COMMANDS_PER_EVENT:
+            raise ReplayError(
+                f"events.jsonl line {line_number} exceeds replay command limit"
+            )
+        for command in commands:
+            _validate_replay_command(command, line_number=line_number)
+        return
+    if event_type == "workspace_revision_changed":
+        mutation_seq = payload.get("mutation_seq")
+        if (
+            not isinstance(mutation_seq, int)
+            or isinstance(mutation_seq, bool)
+            or mutation_seq < 1
+        ):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has invalid mutation_seq"
+            )
+        return
+    if event_type == "provider_retry":
+        attempt = payload.get("attempt")
+        delay = payload.get("delay_seconds")
+        if not isinstance(attempt, int) or isinstance(attempt, bool) or attempt < 1:
+            raise ReplayError(f"events.jsonl line {line_number} has invalid attempt")
+        if (
+            not isinstance(delay, (int, float))
+            or isinstance(delay, bool)
+            or (isinstance(delay, float) and not math.isfinite(delay))
+            or delay < 0
+        ):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has invalid delay_seconds"
+            )
+        return
+    if event_type in {"run_finished", "run_failed", "run_cancelled"}:
+        final_state = _required_replay_text(payload, "state", line_number)
+        if final_state not in _REPLAY_STATES or final_state != event["state"]:
+            raise ReplayError(
+                f"events.jsonl line {line_number} has inconsistent final state"
+            )
+
+
+def _required_replay_text(
+    payload: Mapping[str, Any],
+    field: str,
+    line_number: int,
+) -> str:
+    value = payload.get(field)
+    if not isinstance(value, str) or not value:
+        raise ReplayError(f"events.jsonl line {line_number} has invalid {field}")
+    return value
+
+
+def _validate_replay_command(command: Any, *, line_number: int) -> None:
+    if not isinstance(command, dict):
+        raise ReplayError(
+            f"events.jsonl line {line_number} has an invalid command result"
+        )
+    if "exit_code" not in command:
+        raise ReplayError(
+            f"events.jsonl line {line_number} has an invalid command exit_code"
+        )
+    exit_code = command["exit_code"]
+    if exit_code is not None and (
+        not isinstance(exit_code, int) or isinstance(exit_code, bool)
+    ):
+        raise ReplayError(
+            f"events.jsonl line {line_number} has an invalid command exit_code"
+        )
+    for field in ("timed_out", "started"):
+        if not isinstance(command.get(field), bool):
+            raise ReplayError(
+                f"events.jsonl line {line_number} has an invalid command {field}"
+            )
+
+
+def _replay_event_details(
+    event_type: str,
+    payload: Mapping[str, Any],
+) -> list[str]:
+    details: list[str] = []
+    if event_type == "state_changed":
+        details.extend(
+            [
+                f"from={_replay_scalar(payload.get('from_state'))}",
+                f"to={_replay_scalar(payload.get('to_state'))}",
+            ]
+        )
+    if event_type in {
+        "tool_call_received",
+        "tool_execution_started",
+        "tool_execution_finished",
+    }:
+        details.extend(
+            [
+                f"tool={_replay_scalar(payload.get('tool_name'))}",
+            ]
+        )
+        if event_type == "tool_execution_finished":
+            if payload.get("cancelled") is True:
+                details.append("cancelled=true")
+            else:
+                details.append(f"ok={_replay_scalar(payload.get('ok'))}")
+            content = payload.get("content")
+            if isinstance(content, Mapping) and "exit_code" in content:
+                details.append(
+                    f"exit_code={_replay_scalar(content.get('exit_code'))}"
+                )
+    if event_type in {"baseline_finished", "verification_finished"}:
+        if payload.get("cancelled") is True:
+            details.append("cancelled=true")
+        elif "passed" not in payload:
+            details.append(
+                f"error_kind={_replay_scalar(payload.get('error_kind'))}"
+            )
+        else:
+            details.extend(
+                [
+                    f"passed={_replay_scalar(payload.get('passed'))}",
+                    f"skipped={_replay_scalar(payload.get('skipped'))}",
+                    f"failure_kind={_replay_scalar(payload.get('failure_kind'))}",
+                ]
+            )
+    if event_type == "workspace_revision_changed":
+        details.append(
+            f"mutation_seq={_replay_scalar(payload.get('mutation_seq'))}"
+        )
+    if event_type == "provider_retry":
+        details.extend(
+            [
+                f"attempt={_replay_scalar(payload.get('attempt'))}",
+                f"delay_seconds={_replay_scalar(payload.get('delay_seconds'))}",
+            ]
+        )
+    if event_type in {"run_finished", "run_failed", "run_cancelled"}:
+        details.append(f"final_state={_replay_scalar(payload.get('state'))}")
+    return details
+
+
+def _replay_scalar(value: Any) -> str:
+    if value is None:
+        return "null"
+    if isinstance(value, bool):
+        return "true" if value else "false"
+    if isinstance(value, int) and not isinstance(value, bool):
+        return _preview_text(str(value), 160)[0]
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return "<invalid>"
+        return format(value, ".6g")
+    return _replay_label(value)
+
+
+def _replay_label(value: Any) -> str:
+    if not isinstance(value, str):
+        return "<invalid>"
+    redacted = _AUTHORIZATION_BEARER.sub(
+        lambda match: match.group(1) + REDACTION_MARKER,
+        value,
+    )
+    normalized = " ".join(redacted.split())
+    terminal_safe = "".join(
+        character if character.isprintable() else _escaped_codepoint(character)
+        for character in normalized
+    )
+    return _preview_text(terminal_safe, 160)[0]
+
+
+def _escaped_codepoint(value: str) -> str:
+    codepoint = ord(value)
+    if codepoint <= 0xFF:
+        return f"\\x{codepoint:02x}"
+    if codepoint <= 0xFFFF:
+        return f"\\u{codepoint:04x}"
+    return f"\\U{codepoint:08x}"
+
+
+def _reject_json_constant(value: str) -> None:
+    raise ValueError(f"non-standard JSON constant: {value}")
 
 
 def _result_payload(
