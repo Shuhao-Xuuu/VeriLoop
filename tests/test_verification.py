@@ -1412,3 +1412,190 @@ argv = ["python", "verify.py"]
     assert result.final_verification is None
     assert result.verified_seq is None
     assert not marker.exists()
+
+
+def test_failed_verification_evidence_is_seen_then_repair_can_verify(
+    tmp_path: Path,
+) -> None:
+    verify = tmp_path / "verify.py"
+    original = b"raise SystemExit(1)\n"
+    verify.write_bytes(original)
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 1
+max_same_failure = 9
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    first_completion = ToolCall(
+        id="complete-first",
+        name="complete_task",
+        arguments={"summary": "first attempt"},
+    )
+    repair = ToolCall(
+        id="repair",
+        name="edit_file",
+        arguments={
+            "path": "verify.py",
+            "old_text": "raise SystemExit(1)",
+            "new_text": "raise SystemExit(0)",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    second_completion = ToolCall(
+        id="complete-second",
+        name="complete_task",
+        arguments={"summary": "repaired"},
+    )
+    model = ScriptedModel(
+        [
+            tool_response(first_completion),
+            tool_response(repair),
+            tool_response(second_completion),
+        ]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFIED
+    assert result.repair_rounds_used == 1
+    assert result.mutation_seq == result.verified_seq == 1
+    assert model.call_count == 3
+    failure_seen = [
+        message.tool_result
+        for message in model.calls[1][0]
+        if message.tool_result is not None
+    ][-1]
+    assert failure_seen.call_id == "complete-first"
+    assert failure_seen.retryable is True
+    failure_payload = json.loads(failure_seen.content)
+    assert failure_payload["commands"][0]["exit_code"] == 1
+    assert failure_payload["remaining_repair_rounds"] == 1
+    lifecycle = [
+        state
+        for state in result.state_history
+        if state
+        in {
+            AgentState.VERIFYING,
+            AgentState.RECOVERING,
+            AgentState.THINKING,
+            AgentState.VERIFIED,
+        }
+    ]
+    first_verifying = lifecycle.index(AgentState.VERIFYING)
+    assert lifecycle[first_verifying : first_verifying + 3] == [
+        AgentState.VERIFYING,
+        AgentState.RECOVERING,
+        AgentState.THINKING,
+    ]
+    assert lifecycle[-2:] == [AgentState.VERIFYING, AgentState.VERIFIED]
+
+
+@pytest.mark.parametrize("max_repair_rounds", [0, 1, 2])
+def test_repair_budget_allows_exactly_one_plus_configured_final_attempts(
+    tmp_path: Path,
+    max_repair_rounds: int,
+) -> None:
+    (tmp_path / "always_fail.py").write_text(
+        """
+from pathlib import Path
+path = Path("attempts.txt")
+count = int(path.read_text()) if path.exists() else 0
+path.write_text(str(count + 1))
+raise SystemExit(3)
+""",
+        encoding="utf-8",
+    )
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        f"""
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = {max_repair_rounds}
+max_same_failure = 99
+[[verification.commands]]
+argv = ["python", "always_fail.py"]
+""",
+    )
+    attempts = 1 + max_repair_rounds
+    responses = [
+        tool_response(
+            ToolCall(
+                id=f"complete-{index}",
+                name="complete_task",
+                arguments={"summary": f"attempt {index}"},
+            )
+        )
+        for index in range(attempts)
+    ]
+    model = ScriptedModel(responses)
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.VERIFICATION_FAILED
+    assert result.repair_rounds_used == max_repair_rounds
+    assert model.call_count == attempts
+    assert int((tmp_path / "attempts.txt").read_text(encoding="utf-8")) == attempts
+    assert result.mutation_seq == 0
+    completion_results = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+        and message.tool_result.tool_name == "complete_task"
+    ]
+    assert len(completion_results) == attempts
+    assert sum(item.retryable for item in completion_results) == max_repair_rounds
+    assert completion_results[-1].retryable is False
+    assert json.loads(completion_results[-1].content)[
+        "remaining_repair_rounds"
+    ] == 0
+
+
+def test_plain_final_during_recovery_stays_unverified_and_preserves_failure(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(2)\n", encoding="utf-8")
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 2
+max_same_failure = 9
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    completion = ToolCall(
+        id="complete-failed",
+        name="complete_task",
+        arguments={"summary": "not ready"},
+    )
+    model = ScriptedModel(
+        [tool_response(completion), final_response("giving up, VERIFIED")]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.final_message == "giving up, VERIFIED"
+    assert result.repair_rounds_used == 1
+    assert result.final_verification is not None
+    assert result.final_verification.passed is False
+    assert result.verified_seq is None

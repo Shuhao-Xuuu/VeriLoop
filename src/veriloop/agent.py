@@ -70,6 +70,7 @@ class AgentLoop:
         verified_seq = None
         baseline_verification = None
         final_verification = None
+        repair_rounds_used = 0
 
         def transition(next_state: AgentState) -> None:
             nonlocal state
@@ -93,6 +94,7 @@ class AgentLoop:
                 verified_seq=verified_seq,
                 baseline_verification=baseline_verification,
                 final_verification=final_verification,
+                repair_rounds_used=repair_rounds_used,
                 state_history=tuple(state_history),
             )
 
@@ -305,12 +307,34 @@ class AgentLoop:
                 failure_kind = (
                     final_verification.failure_kind or ErrorKind.VERIFICATION_FAILED
                 )
+                max_repair_rounds = self._verification_gate.spec.max_repair_rounds
+                if repair_rounds_used < max_repair_rounds:
+                    remaining_repair_rounds = (
+                        max_repair_rounds - repair_rounds_used
+                    )
+                    repair_rounds_used += 1
+                    history.append(
+                        _tool_message(
+                            _verification_tool_result(
+                                call,
+                                final_verification,
+                                verified=False,
+                                retryable=True,
+                                remaining_repair_rounds=remaining_repair_rounds,
+                            )
+                        )
+                    )
+                    transition(AgentState.RECOVERING)
+                    continue
+
                 history.append(
                     _tool_message(
                         _verification_tool_result(
                             call,
                             final_verification,
                             verified=False,
+                            retryable=False,
+                            remaining_repair_rounds=0,
                         )
                     )
                 )
@@ -383,6 +407,8 @@ def _verification_tool_result(
     verification: VerificationResult,
     *,
     verified: bool,
+    retryable: bool = False,
+    remaining_repair_rounds: int = 0,
 ) -> ToolResult:
     failure_kind = verification.failure_kind or ErrorKind.VERIFICATION_FAILED
     payload = {
@@ -391,7 +417,11 @@ def _verification_tool_result(
         "state": (
             AgentState.VERIFIED.value
             if verified
-            else AgentState.VERIFICATION_FAILED.value
+            else (
+                AgentState.RECOVERING.value
+                if retryable
+                else AgentState.VERIFICATION_FAILED.value
+            )
         ),
         "mutation_seq": verification.mutation_seq,
         "verified_seq": verification.verified_seq,
@@ -424,6 +454,7 @@ def _verification_tool_result(
             for command in verification.commands
         ],
         "failure_kind": None if verified else failure_kind.value,
+        "remaining_repair_rounds": remaining_repair_rounds,
     }
     return ToolResult(
         call_id=call.id,
@@ -431,12 +462,14 @@ def _verification_tool_result(
         ok=verified,
         content=json.dumps(payload, ensure_ascii=False, sort_keys=True),
         error_kind=None if verified else failure_kind,
-        retryable=False,
+        retryable=retryable,
         metadata={
             "completion_requested": True,
             "verification": True,
             "verified": verified,
             "mutation_seq": verification.mutation_seq,
             "verified_seq": verification.verified_seq,
+            "retryable": retryable,
+            "remaining_repair_rounds": remaining_repair_rounds,
         },
     )
