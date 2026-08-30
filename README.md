@@ -64,10 +64,11 @@ not print them, store them, or pass them into child processes.
 ## Trust boundary and limits
 
 `WorkspaceGuard` constrains VeriLoop's own file tools. It rejects absolute and
-escaping paths, canonical symlink escapes, sensitive reads, and protected
-writes. `CommandPolicy` blocks obvious destructive, shell-host, downloader,
-installer, and mutating Git command shapes. Commands always use `shell=False`,
-an in-workspace `cwd`, a timeout, and a newly constructed child environment.
+escaping paths, canonical symlink escapes, sensitive reads, direct reads of
+protected metadata directories, and protected writes. `CommandPolicy` blocks
+obvious destructive, shell-host, downloader, installer, and mutating Git
+command shapes. Commands always use `shell=False`, an in-workspace `cwd`, a
+timeout, and a newly constructed child environment.
 
 These controls are not an OS sandbox. An in-workspace Python script, pytest, or
 other explicitly allowed program is repository code and can still attempt to

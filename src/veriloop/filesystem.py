@@ -50,6 +50,7 @@ _SENSITIVE_EXACT_NAMES = frozenset(
         "serviceaccountkey.json",
     }
 )
+_PROTECTED_METADATA_COMPONENTS = frozenset({".git", ".veriloop"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -103,6 +104,15 @@ class WorkspaceGuard:
         allow_root: bool = False,
     ) -> Path:
         resolved = self._resolve(model_path, allow_root=allow_root)
+        if _has_protected_metadata_component(
+            Path(model_path).parts,
+            PureWindowsPath(model_path).parts,
+            resolved.relative.parts,
+        ):
+            raise ToolExecutionError(
+                ErrorKind.PATH_READ_DENIED,
+                f"reading protected path is denied: {model_path}",
+            )
         if self._is_sensitive(resolved.relative) or self._is_sensitive_lexical(
             model_path
         ):
@@ -126,10 +136,10 @@ class WorkspaceGuard:
                 ErrorKind.PATH_WRITE_DENIED,
                 f"writing protected path is denied: {model_path}",
             )
-        protected_components = {".git", ".veriloop"}
-        if any(
-            _policy_component(part) in protected_components
-            for part in (*Path(model_path).parts, *resolved.relative.parts)
+        if _has_protected_metadata_component(
+            Path(model_path).parts,
+            PureWindowsPath(model_path).parts,
+            resolved.relative.parts,
         ):
             raise ToolExecutionError(
                 ErrorKind.PATH_WRITE_DENIED,
@@ -807,6 +817,19 @@ def _atomic_replace(
                     ErrorKind.FILE_ALREADY_EXISTS,
                     f"create target already exists: {guard.relative(target)}",
                 )
+            try:
+                if os.name == "nt":
+                    os.rename(temp_path, target)
+                    temp_path = None
+                else:
+                    os.link(temp_path, target)
+            except FileExistsError as exc:
+                display_path = target.relative_to(guard.root).as_posix()
+                raise ToolExecutionError(
+                    ErrorKind.FILE_ALREADY_EXISTS,
+                    f"create target already exists: {display_path}",
+                ) from exc
+            return
         else:
             current_data, _ = _read_text_file(
                 guard,
@@ -824,8 +847,8 @@ def _atomic_replace(
                         "current_sha256": _sha256(current_data),
                     },
                 )
-        os.replace(temp_path, target)
-        temp_path = None
+            os.replace(temp_path, target)
+            temp_path = None
     except ToolExecutionError:
         raise
     except OSError as exc:
@@ -902,3 +925,11 @@ def _policy_component(value: str) -> str:
     """Normalize names the way common Windows paths ignore trailing dots/spaces."""
 
     return value.rstrip(" .").casefold()
+
+
+def _has_protected_metadata_component(*component_groups: tuple[str, ...]) -> bool:
+    return any(
+        _policy_component(part) in _PROTECTED_METADATA_COMPONENTS
+        for components in component_groups
+        for part in components
+    )

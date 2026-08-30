@@ -62,9 +62,10 @@ final symlink. File tools protect the following basenames case-insensitively:
 - `id_rsa` and `id_ed25519`;
 - `credentials.json` and `serviceAccountKey.json`.
 
-Writes additionally reject any `.git` or `.veriloop` path component. Matching
-uses complete components/globs, so ordinary names containing `env` or `key` do
-not match by substring.
+Direct reads and all writes reject any `.git` or `.veriloop` path component.
+Root traversal also skips these directories. Matching uses complete
+components/globs, so ordinary names containing `env`, `key`, `.git`, or
+`.veriloop` do not match by substring.
 
 File content is limited to ordinary UTF-8 text with no NUL byte and at most
 1 MiB by default. Directories, non-regular files, invalid UTF-8, binary/NUL
@@ -114,10 +115,12 @@ and a bounded diff preview.
 Inputs are `path`, `content`, `mode` (`create` or `overwrite`), and optional
 nullable `expected_sha256`. Create requires a missing target, an existing parent
 directory, and no expected digest. It never creates parent directories or
-overwrites an existing target. Overwrite requires an existing regular text file
-and matching digest. Both modes use the same-directory temporary file and atomic
-replacement flow. Append, delete, rename, chmod, and arbitrary directory
-creation are not exposed.
+overwrites an existing target. Its final installation is atomic and no-clobber:
+Windows uses non-replacing `os.rename`, while POSIX creates the destination with
+`os.link`. Overwrite requires an existing regular text file and matching digest
+and installs with `os.replace`. Both modes first write a same-directory temporary
+file. Append, delete, rename, chmod, and arbitrary directory creation are not
+exposed.
 
 ## Command tool
 

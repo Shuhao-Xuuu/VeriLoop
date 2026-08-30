@@ -131,6 +131,77 @@ def test_read_missing_directory_and_sensitive_path_errors(tmp_path: Path) -> Non
     assert protected.error_kind is ErrorKind.PATH_READ_DENIED
 
 
+@pytest.mark.parametrize(
+    ("path", "payload"),
+    [
+        (".git/config", "git metadata"),
+        (".veriloop/state.json", "VeriLoop metadata"),
+        (".GIT/config", "case alias"),
+    ],
+)
+def test_read_file_rejects_protected_metadata_directories(
+    tmp_path: Path,
+    path: str,
+    payload: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    target = workspace / path
+    target.parent.mkdir(parents=True)
+    target.write_text(payload, encoding="utf-8")
+    _, registry = make_registry(workspace)
+
+    result = execute(registry, "read_file", {"path": path})
+
+    assert result.error_kind is ErrorKind.PATH_READ_DENIED
+    assert payload not in result.content
+
+
+@pytest.mark.parametrize(
+    "path",
+    [".git./config", ".git /config", ".VERILOOP./state.json"],
+)
+def test_read_file_rejects_lexical_protected_directory_aliases(
+    tmp_path: Path,
+    path: str,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    _, registry = make_registry(workspace)
+
+    result = execute(registry, "read_file", {"path": path})
+
+    assert result.error_kind is ErrorKind.PATH_READ_DENIED
+
+
+def test_read_file_rejects_canonical_alias_into_protected_directory(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    protected = workspace / ".git"
+    protected.mkdir(parents=True)
+    (protected / "config").write_text("hidden metadata", encoding="utf-8")
+    create_symlink_or_skip(workspace / "metadata", protected, directory=True)
+    _, registry = make_registry(workspace)
+
+    result = execute(registry, "read_file", {"path": "metadata/config"})
+
+    assert result.error_kind is ErrorKind.PATH_READ_DENIED
+    assert "hidden metadata" not in result.content
+
+
+def test_protected_component_matching_does_not_reject_ordinary_names(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / ".gitignore").write_text("ordinary", encoding="utf-8")
+    (workspace / "veriloop_notes.txt").write_text("ordinary", encoding="utf-8")
+    _, registry = make_registry(workspace)
+
+    assert execute(registry, "read_file", {"path": ".gitignore"}).ok
+    assert execute(registry, "read_file", {"path": "veriloop_notes.txt"}).ok
+
+
 def test_sensitive_matching_is_component_aware(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     source = workspace / "src"
@@ -284,20 +355,22 @@ def test_list_files_max_results_sets_truncated(tmp_path: Path) -> None:
     assert payload["truncated"] is True
 
 
-def test_list_and_search_skip_explicit_git_path(tmp_path: Path) -> None:
+def test_list_and_search_reject_explicit_git_path(tmp_path: Path) -> None:
     workspace = tmp_path / "workspace"
     git_dir = workspace / ".git"
     git_dir.mkdir(parents=True)
     (git_dir / "config").write_text("hidden needle", encoding="utf-8")
     _, registry = make_registry(workspace)
 
-    listed = content(execute(registry, "list_files", {"path": ".git"}))
-    searched = content(
-        execute(registry, "search_text", {"path": ".git", "query": "needle"})
+    listed = execute(registry, "list_files", {"path": ".git"})
+    searched = execute(
+        registry,
+        "search_text",
+        {"path": ".git", "query": "needle"},
     )
 
-    assert listed["entries"] == []
-    assert searched["matches"] == []
+    assert listed.error_kind is ErrorKind.PATH_READ_DENIED
+    assert searched.error_kind is ErrorKind.PATH_READ_DENIED
 
 
 def test_skip_names_do_not_hide_regular_files(tmp_path: Path) -> None:
@@ -649,6 +722,55 @@ def test_write_file_create_and_overwrite_failures(tmp_path: Path) -> None:
     assert stale.error_kind is ErrorKind.STALE_FILE
     assert missing_parent.error_kind is ErrorKind.PATH_NOT_FOUND
     assert target.read_text(encoding="utf-8") == "original"
+
+
+def test_write_create_does_not_clobber_target_appearing_at_install(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    target = workspace / "new.txt"
+    external = b"external winner"
+    original_replace = filesystem.os.replace
+
+    def inject_competing_target(destination) -> None:
+        destination_path = Path(destination)
+        if not destination_path.exists():
+            destination_path.write_bytes(external)
+
+    def racing_replace(source, destination) -> None:
+        inject_competing_target(destination)
+        original_replace(source, destination)
+
+    monkeypatch.setattr(filesystem.os, "replace", racing_replace)
+    if os.name == "nt":
+        original_install = filesystem.os.rename
+
+        def racing_install(source, destination) -> None:
+            inject_competing_target(destination)
+            original_install(source, destination)
+
+        monkeypatch.setattr(filesystem.os, "rename", racing_install)
+    else:
+        original_install = filesystem.os.link
+
+        def racing_install(source, destination) -> None:
+            inject_competing_target(destination)
+            original_install(source, destination)
+
+        monkeypatch.setattr(filesystem.os, "link", racing_install)
+
+    _, registry = make_registry(workspace)
+    result = execute(
+        registry,
+        "write_file",
+        {"path": "new.txt", "content": "candidate", "mode": "create"},
+    )
+
+    assert result.error_kind is ErrorKind.FILE_ALREADY_EXISTS
+    assert target.read_bytes() == external
+    assert [item.name for item in workspace.iterdir()] == ["new.txt"]
 
 
 @pytest.mark.parametrize("path", [".git/config", ".veriloop/state.json", ".env", "key.pem"])

@@ -71,9 +71,10 @@ the root, calls `resolve(strict=False)`, then proves component containment with
 directories without relying on string prefixes.
 
 Protection checks apply to complete relative components or basenames/globs.
-Sensitive file contents cannot be read or searched. `.git` and `.veriloop`
-components cannot be written. Traversal is explicit and sorted; excluded
-directories and symlink/reparse-point directories are never descended into.
+Sensitive file contents cannot be read or searched. Direct reads and all writes
+reject `.git` and `.veriloop` components on both lexical and canonical paths.
+Traversal is explicit and sorted; excluded directories and
+symlink/reparse-point directories are never descended into.
 
 All file reads take at most `max_file_bytes + 1` bytes, then enforce size, NUL,
 and UTF-8 rules. `read_file` hashes the original bytes before any text rendering,
@@ -97,11 +98,13 @@ canonical/protection checks
  -> cleanup any remaining temporary path
 ```
 
-Create uses a second absence check immediately before replacement. The project
-assumes one agent and one process; this is a deterministic stale-write guard, not
-an adversarial concurrent transaction manager. Failure before `os.replace`
-leaves the original bytes unchanged. The API has no delete, rename, append, or
-chmod operation.
+Create uses a second absence check and then an atomic no-clobber installation:
+non-replacing `os.rename` on Windows and `os.link` on POSIX. A destination that
+appears in the final window wins and produces `FILE_ALREADY_EXISTS`. Overwrite
+uses the final SHA check followed by `os.replace`. The project assumes one agent
+and one process; this is a deterministic stale-write guard, not an adversarial
+concurrent transaction manager. The API has no delete, rename, append, or chmod
+operation.
 
 ## Command trust boundary
 

@@ -98,11 +98,12 @@ hidden only in an internal field.
 6. proves `resolved.is_relative_to(root)`;
 7. rejects the root itself when a file is required.
 
-`resolve_for_read` then checks sensitive basenames on both lexical and canonical
-paths. `resolve_for_write` additionally rejects a final symlink/reparse point,
-sensitive files, and every `.git`/`.veriloop` component. This is why a path alias
-cannot bypass protection and why rejection happens before a temporary file or
-process is created.
+`resolve_for_read` then checks sensitive basenames and every `.git`/`.veriloop`
+component on both lexical and canonical paths. `resolve_for_write` applies the
+same metadata-component policy and additionally rejects a final
+symlink/reparse point and sensitive files. This is why a path alias cannot bypass
+protection and why rejection happens before a temporary file or process is
+created.
 
 Traversal uses sorted `Path.iterdir` results. It yields a symlink entry but
 checks link/reparse state before testing directories and never recurses through
@@ -140,10 +141,12 @@ failures.
 
 `_atomic_replace` creates a named temporary file in `target.parent`, writes all
 bytes, flushes, calls `os.fsync`, closes the handle, and applies original
-permission bits for edit/overwrite. Immediately before `os.replace`, it re-reads
-the target and compares SHA again. Create instead checks that no target or
-symlink has appeared. Only then does `os.replace(temp, target)` install the
-candidate.
+permission bits for edit/overwrite. Immediately before overwrite's
+`os.replace`, it re-reads the target and compares SHA again. Create performs a
+quick absence check, then atomically installs without clobbering: Windows uses
+non-replacing `os.rename`, while POSIX uses `os.link` and removes the temporary
+name. If a competing target appears, it remains intact and the tool returns
+`FILE_ALREADY_EXISTS`.
 
 The `finally` path removes any temporary name that was not successfully moved.
 Tests inject both `os.replace` failure and a change between temporary write and
@@ -242,13 +245,13 @@ file, the second check exits 0, and the final state is still
 | Behavior | Test location |
 | --- | --- |
 | Canonical root, nested/missing path, `..`, drive/absolute/prefix/colon rejection | `tests/test_filesystem.py` opening guard tests |
-| Missing file, directory-as-file, sensitive names and component-aware matching | `test_read_missing_directory_and_sensitive_path_errors`, `test_sensitive_matching_is_component_aware` |
+| Missing file, directory-as-file, sensitive names and protected metadata components | `test_read_missing_directory_and_sensitive_path_errors`, `test_read_file_rejects_protected_*`, `test_sensitive_matching_is_component_aware` |
 | UTF-8 ranges, SHA, line bounds, NUL/invalid UTF-8/size | `test_read_file_*` |
 | Listing order/depth/result truncation/cache skip | `test_list_files_*` |
 | Literal/case search, empty query, bounds, binary/large skip | `test_search_text_*` |
 | Unique edit, permissions, stale/not-found/ambiguous/no-change/no mutation | `test_edit_file_*` |
 | Same-directory replace, replace failure cleanup, final SHA recheck | `test_atomic_replace_*`, `test_edit_rechecks_sha_immediately_before_replace` |
-| Create/overwrite modes, missing SHA/parent, stale/protected/content limits | `test_write_file_*` |
+| Create/overwrite modes, no-clobber race, missing SHA/parent, stale/protected/content limits | `test_write_file_*`, `test_write_create_does_not_clobber_target_appearing_at_install` |
 | External file/directory symlinks and no traversal | final symlink tests in `tests/test_filesystem.py` |
 | Exit zero/nonzero and simultaneous stdout/stderr | opening tests in `tests/test_process.py` |
 | Timeout/direct-child stop and POSIX group stop | `test_timeout_ends_direct_child_and_returns_output`, `test_timeout_ends_posix_process_group` |
