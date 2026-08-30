@@ -12,7 +12,7 @@ import re
 import stat
 import tempfile
 import tomllib
-from typing import Any
+from typing import Any, Sequence
 
 from .filesystem import (
     SKIPPED_DIRECTORIES,
@@ -31,7 +31,7 @@ from .protocol import (
     VerificationPhase,
     VerificationResult,
 )
-from .tools import ToolExecutionError
+from .tools import ToolExecutionError, contains_known_secret
 
 
 DEFAULT_CONFIG_PATH = ".veriloop.toml"
@@ -237,9 +237,17 @@ def load_verification_spec(
     guard: WorkspaceGuard,
     runner: CommandRunner,
     config_path: str | Path = DEFAULT_CONFIG_PATH,
+    *,
+    known_secrets: Sequence[str] = (),
 ) -> VerificationSpec:
     """Load one workspace-relative TOML file into an immutable specification."""
 
+    if isinstance(config_path, (str, Path)) and contains_known_secret(
+        str(config_path), known_secrets
+    ):
+        raise VerificationConfigError(
+            "verification config path contains a host credential"
+        )
     relative_config, resolved_config = _resolve_config_path(guard, config_path)
     if not resolved_config.exists():
         return _empty_spec(relative_config)
@@ -263,13 +271,23 @@ def load_verification_spec(
             f"verification config exceeds {guard.max_file_bytes} bytes"
         )
     try:
-        document = tomllib.loads(raw_bytes.decode("utf-8"))
+        decoded = raw_bytes.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise VerificationConfigError("verification config must be UTF-8") from exc
+    if contains_known_secret(decoded, known_secrets):
+        raise VerificationConfigError(
+            "verification config contains a host credential"
+        )
+    try:
+        document = tomllib.loads(decoded)
     except tomllib.TOMLDecodeError as exc:
         raise VerificationConfigError(
             f"verification config contains invalid TOML: {exc}"
         ) from exc
+    if contains_known_secret(document, known_secrets):
+        raise VerificationConfigError(
+            "verification config contains a host credential"
+        )
 
     if set(document) - {"verification"}:
         name = sorted(set(document) - {"verification"})[0]
@@ -308,6 +326,7 @@ def load_verification_spec(
         raw_verification.get("commands", []),
         guard=guard,
         runner=runner,
+        known_secrets=known_secrets,
     )
 
     return VerificationSpec(
@@ -595,6 +614,7 @@ def _commands(
     *,
     guard: WorkspaceGuard,
     runner: CommandRunner,
+    known_secrets: Sequence[str],
 ) -> tuple[VerificationCommandSpec, ...]:
     if not isinstance(value, list):
         raise VerificationConfigError("verification.commands must be an array of tables")
@@ -622,6 +642,10 @@ def _commands(
         if not isinstance(cwd, str) or not cwd:
             raise VerificationConfigError(
                 f"verification command {index} cwd must be a non-empty string"
+            )
+        if contains_known_secret({"argv": argv, "cwd": cwd}, known_secrets):
+            raise VerificationConfigError(
+                f"verification command {index} contains a host credential"
             )
         timeout = item.get("timeout_seconds", 60)
         if not isinstance(timeout, int) or isinstance(timeout, bool):

@@ -2,8 +2,10 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
 import json
 import time
+from typing import Sequence
 
 from .context import ContextPolicy
 from .model import ModelClient, ModelClientError, ModelProtocolError
@@ -21,6 +23,7 @@ from .protocol import (
 from .tools import (
     COMPLETE_TASK_TOOL_NAME,
     ToolRegistry,
+    contains_known_secret,
     make_tool_failure,
 )
 from .trace import (
@@ -61,6 +64,7 @@ class AgentLoop:
         verification_gate: VerificationGate | None = None,
         context_policy: ContextPolicy | None = None,
         trace_writer: TraceWriter | None = None,
+        known_secrets: Sequence[str] = (),
     ) -> None:
         if max_steps < 0:
             raise ValueError("max_steps must be non-negative")
@@ -71,14 +75,26 @@ class AgentLoop:
         self._verification_gate = verification_gate
         self._context_policy = context_policy or ContextPolicy()
         self._trace_writer = trace_writer
+        self._known_secrets = tuple(
+            secret for secret in known_secrets if isinstance(secret, str) and secret
+        )
 
     def run(self, task: str) -> AgentResult:
         started_at = time.monotonic()
         state = AgentState.INITIALIZING
         state_history = [state]
         history = [
-            Message(role=Role.SYSTEM, content=self._system_prompt),
-            Message(role=Role.USER, content=task),
+            Message(
+                role=Role.SYSTEM,
+                content=_redact_known_secrets(
+                    self._system_prompt,
+                    self._known_secrets,
+                ),
+            ),
+            Message(
+                role=Role.USER,
+                content=_redact_known_secrets(task, self._known_secrets),
+            ),
         ]
         step_count = 0
         tool_call_count = 0
@@ -92,6 +108,29 @@ class AgentLoop:
         changed_files: set[str] = set()
         model_usage: dict[str, int] = {}
         trace_available = self._trace_writer is not None
+
+        def execute_tool(call: ToolCall) -> tuple[ToolResult, bool]:
+            if contains_known_secret(
+                {
+                    "call_id": call.id,
+                    "tool_name": call.name,
+                    "arguments": call.arguments,
+                },
+                self._known_secrets,
+            ):
+                return (
+                    _redact_tool_result(
+                        make_tool_failure(
+                            call,
+                            ErrorKind.INVALID_ARGUMENTS,
+                            "tool request contains a host credential",
+                        ),
+                        self._known_secrets,
+                    ),
+                    False,
+                )
+            result = self._tools.execute(call)
+            return _redact_tool_result(result, self._known_secrets), True
 
         def trace(event_type: str, payload: dict[str, object] | None = None) -> None:
             nonlocal trace_available
@@ -126,13 +165,28 @@ class AgentLoop:
             error: AgentError | None = None,
         ) -> AgentResult:
             duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
+            safe_final_message = _redact_known_secrets(
+                final_message,
+                self._known_secrets,
+            )
+            safe_error = (
+                replace(
+                    error,
+                    message=_redact_known_secrets(
+                        error.message,
+                        self._known_secrets,
+                    ),
+                )
+                if error is not None
+                else None
+            )
             result = AgentResult(
                 state=state,
-                final_message=final_message,
+                final_message=safe_final_message,
                 step_count=step_count,
                 tool_call_count=tool_call_count,
                 history=tuple(history),
-                error=error,
+                error=safe_error,
                 mutation_seq=mutation_seq,
                 verified_seq=verified_seq,
                 baseline_verification=baseline_verification,
@@ -164,18 +218,22 @@ class AgentLoop:
                     "changed_files": list(result.changed_files),
                     "duration_ms": duration_ms,
                     "model_usage": result.model_usage,
-                    "error_kind": error.kind.value if error is not None else None,
-                    "error_message": error.message if error is not None else None,
+                    "error_kind": (
+                        safe_error.kind.value if safe_error is not None else None
+                    ),
+                    "error_message": (
+                        safe_error.message if safe_error is not None else None
+                    ),
                 }
                 if state is AgentState.CANCELLED:
                     trace("run_cancelled", terminal_payload)
-                elif error is not None:
+                elif safe_error is not None:
                     trace("run_failed", terminal_payload)
                 trace(
                     "run_finished",
                     {
                         **terminal_payload,
-                        "final_message": final_message,
+                        "final_message": safe_final_message,
                     },
                 )
                 try:
@@ -207,8 +265,11 @@ class AgentLoop:
                 },
             )
             try:
-                baseline_verification = self._verification_gate.run_baseline(
-                    mutation_seq=mutation_seq
+                baseline_verification = _redact_verification_result(
+                    self._verification_gate.run_baseline(
+                        mutation_seq=mutation_seq
+                    ),
+                    self._known_secrets,
                 )
             except KeyboardInterrupt:
                 trace("baseline_finished", {"cancelled": True})
@@ -309,6 +370,29 @@ class AgentLoop:
                     visible_history,
                     self._tools.schemas(),
                 )
+                if contains_known_secret(
+                    {
+                        "text": response.text,
+                        "tool_calls": [
+                            {
+                                "call_id": call.id,
+                                "tool_name": call.name,
+                                "arguments": call.arguments,
+                            }
+                            for call in response.tool_calls
+                        ],
+                        "usage": response.usage,
+                    },
+                    self._known_secrets,
+                ):
+                    transition(AgentState.FAILED)
+                    return finish(
+                        "",
+                        error=AgentError(
+                            kind=ErrorKind.INVALID_ARGUMENTS,
+                            message="model response contains a host credential",
+                        ),
+                    )
                 for key, value in response.usage.items():
                     if isinstance(value, int) and not isinstance(value, bool):
                         model_usage[key] = model_usage.get(key, 0) + value
@@ -403,7 +487,7 @@ class AgentLoop:
                 transition(AgentState.EXECUTING)
                 trace("tool_execution_started", tool_call_payload(call))
                 try:
-                    request_result = self._tools.execute(call)
+                    request_result, request_executed = execute_tool(call)
                 except KeyboardInterrupt:
                     trace(
                         "tool_execution_finished",
@@ -427,7 +511,10 @@ class AgentLoop:
                     history.append(_tool_message(request_result))
                     trace(
                         "tool_execution_finished",
-                        tool_result_payload(request_result),
+                        tool_result_payload(
+                            request_result,
+                            executed=request_executed,
+                        ),
                     )
                     continue
 
@@ -470,8 +557,11 @@ class AgentLoop:
                     },
                 )
                 try:
-                    final_verification = self._verification_gate.run_final(
-                        mutation_seq=mutation_seq
+                    final_verification = _redact_verification_result(
+                        self._verification_gate.run_final(
+                            mutation_seq=mutation_seq
+                        ),
+                        self._known_secrets,
                     )
                 except KeyboardInterrupt:
                     trace(
@@ -509,6 +599,10 @@ class AgentLoop:
                         call,
                         ErrorKind.INTERNAL_ERROR,
                         f"unexpected verification error: {type(exc).__name__}: {exc}",
+                    )
+                    failure = _redact_tool_result(
+                        failure,
+                        self._known_secrets,
                     )
                     history.append(_tool_message(failure))
                     trace(
@@ -654,7 +748,7 @@ class AgentLoop:
             for call in response.tool_calls:
                 trace("tool_execution_started", tool_call_payload(call))
                 try:
-                    result = self._tools.execute(call)
+                    result, executed = execute_tool(call)
                 except KeyboardInterrupt:
                     trace(
                         "tool_execution_finished",
@@ -674,7 +768,10 @@ class AgentLoop:
                         ),
                     )
                 tool_call_count += 1
-                trace("tool_execution_finished", tool_result_payload(result))
+                trace(
+                    "tool_execution_finished",
+                    tool_result_payload(result, executed=executed),
+                )
                 changed_path = _successful_file_change(call, result)
                 if changed_path is not None:
                     changed_files.add(changed_path)
@@ -692,6 +789,121 @@ class AgentLoop:
                         },
                     )
                 history.append(_tool_message(result))
+
+
+def _redact_known_secrets(value: str, known_secrets: Sequence[str]) -> str:
+    redacted = value
+    for secret in known_secrets:
+        redacted = redacted.replace(secret, "[REDACTED]")
+    return redacted
+
+
+def _redact_protocol_value(
+    value: object,
+    known_secrets: Sequence[str],
+    *,
+    depth: int = 0,
+    ancestors: frozenset[int] = frozenset(),
+) -> object:
+    if isinstance(value, str):
+        return _redact_known_secrets(value, known_secrets)
+    if depth >= 16:
+        return "[REDACTED]"
+    if isinstance(value, dict):
+        identity = id(value)
+        if identity in ancestors:
+            return "[REDACTED]"
+        nested_ancestors = ancestors | {identity}
+        return {
+            _redact_known_secrets(str(key), known_secrets): _redact_protocol_value(
+                item,
+                known_secrets,
+                depth=depth + 1,
+                ancestors=nested_ancestors,
+            )
+            for key, item in value.items()
+        }
+    if isinstance(value, (list, tuple)):
+        identity = id(value)
+        if identity in ancestors:
+            return "[REDACTED]"
+        nested_ancestors = ancestors | {identity}
+        redacted_items = tuple(
+            _redact_protocol_value(
+                item,
+                known_secrets,
+                depth=depth + 1,
+                ancestors=nested_ancestors,
+            )
+            for item in value
+        )
+        return redacted_items if isinstance(value, tuple) else list(redacted_items)
+    return value
+
+
+def _redact_tool_result(
+    result: ToolResult,
+    known_secrets: Sequence[str],
+) -> ToolResult:
+    if not known_secrets:
+        return result
+    try:
+        parsed_content = json.loads(result.content)
+    except (json.JSONDecodeError, TypeError):
+        content = _redact_known_secrets(result.content, known_secrets)
+    else:
+        content = json.dumps(
+            _redact_protocol_value(parsed_content, known_secrets),
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+    metadata = _redact_protocol_value(result.metadata, known_secrets)
+    return replace(
+        result,
+        call_id=_redact_known_secrets(result.call_id, known_secrets),
+        tool_name=_redact_known_secrets(result.tool_name, known_secrets),
+        content=content,
+        metadata=metadata if isinstance(metadata, dict) else {},
+    )
+
+
+def _redact_verification_result(
+    result: VerificationResult,
+    known_secrets: Sequence[str],
+) -> VerificationResult:
+    if not known_secrets:
+        return result
+    return replace(
+        result,
+        commands=tuple(
+            replace(
+                command,
+                argv=tuple(
+                    _redact_known_secrets(argument, known_secrets)
+                    for argument in command.argv
+                ),
+                cwd=_redact_known_secrets(command.cwd, known_secrets),
+                stdout=_redact_known_secrets(command.stdout, known_secrets),
+                stderr=_redact_known_secrets(command.stderr, known_secrets),
+            )
+            for command in result.commands
+        ),
+        protected_changes=tuple(
+            replace(
+                change,
+                relative_path=_redact_known_secrets(
+                    change.relative_path,
+                    known_secrets,
+                ),
+            )
+            for change in result.protected_changes
+        ),
+        failure_signature=(
+            _redact_known_secrets(result.failure_signature, known_secrets)
+            if result.failure_signature is not None
+            else None
+        ),
+    )
 
 
 def _tool_message(result: ToolResult) -> Message:

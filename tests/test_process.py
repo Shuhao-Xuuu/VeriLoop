@@ -579,6 +579,77 @@ print(json.dumps({name: name in os.environ for name in names} | {'PATH_PRESENT':
     assert "fictional-test-value" not in result.content
 
 
+def test_default_child_environment_removes_copied_provider_secret_values(
+    tmp_path: Path, monkeypatch
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = "fictional-provider-secret"
+    monkeypatch.setenv("OPENAI_API_KEY", secret)
+    monkeypatch.setenv("CI", f"copied-{secret}-value")
+    write_script(
+        workspace,
+        "environment.py",
+        "import os\nprint(os.environ.get('CI', 'missing'))\n",
+    )
+    _, registry = make_runner(workspace)
+
+    class ForbiddenRuntimeEnvironment(dict[str, str]):
+        def __iter__(self):
+            raise AssertionError("CommandRunner read os.environ during run")
+
+        def __getitem__(self, name: str) -> str:
+            raise AssertionError("CommandRunner read os.environ during run")
+
+    monkeypatch.setattr(
+        process_module.os,
+        "environ",
+        ForbiddenRuntimeEnvironment(),
+    )
+
+    result = execute(registry, {"argv": [sys.executable, "environment.py"]})
+
+    assert result.ok
+    assert payload(result)["stdout"].strip() == "missing"
+    assert secret not in result.content
+
+
+def test_explicit_child_environment_is_sanitized_and_frozen(
+    tmp_path: Path,
+) -> None:
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    secret = "fictional-provider-secret"
+    supplied = {
+        "PATH": os.environ.get("PATH", ""),
+        "OPENAI_API_KEY": secret,
+        "CI": f"copied-{secret}-value",
+    }
+    write_script(
+        workspace,
+        "environment.py",
+        "import os\nprint(os.environ.get('CI', 'missing'))\n",
+    )
+    guard = WorkspaceGuard(workspace)
+    runner = CommandRunner(
+        guard,
+        CommandPolicy(),
+        child_environment=supplied,
+    )
+    registry = ToolRegistry()
+    register_process_tool(registry, runner)
+    supplied["CI"] = "changed-after-runner-construction"
+    with pytest.raises(TypeError):
+        runner.child_environment["CI"] = "direct-mutation"  # type: ignore[index]
+
+    result = execute(registry, {"argv": [sys.executable, "environment.py"]})
+
+    assert result.ok
+    assert payload(result)["stdout"].strip() == "missing"
+    assert secret not in result.content
+    assert "changed-after-runner-construction" not in result.content
+
+
 def test_environment_filter_never_reads_disallowed_secret_values() -> None:
     class GuardedEnvironment(dict[str, str]):
         def __getitem__(self, name: str) -> str:

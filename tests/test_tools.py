@@ -7,6 +7,7 @@ from veriloop.tools import (
     ToolExecutionError,
     ToolRegistry,
     ToolSpec,
+    contains_known_secret,
     register_completion_tool,
 )
 
@@ -33,6 +34,18 @@ def register_identity(
             handler=lambda arguments: arguments,
         )
     )
+
+
+def test_known_secret_detection_covers_nested_keys_values_and_cycles() -> None:
+    secret = "provider-secret-for-test"
+    cyclic: list[object] = []
+    cyclic.append(cyclic)
+    cyclic.append({f"prefix-{secret}-suffix": ("safe",)})
+
+    assert contains_known_secret(cyclic, ("", None, secret))  # type: ignore[arg-type]
+    assert contains_known_secret({"outer": [f"prefix-{secret}-suffix"]}, (secret,))
+    assert not contains_known_secret({"outer": ["unrelated"]}, (secret,))
+    assert not contains_known_secret(cyclic, ("different-secret",))
 
 
 def test_register_and_schemas_hide_handler() -> None:

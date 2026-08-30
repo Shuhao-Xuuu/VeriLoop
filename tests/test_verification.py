@@ -259,6 +259,97 @@ def test_invalid_verification_commands_are_rejected(
         load(tmp_path)
 
 
+def test_provider_secret_is_rejected_before_command_policy(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "provider-secret-for-test"
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    write_config(
+        tmp_path,
+        f'''[verification]
+[[verification.commands]]
+argv = ["python", "verify.py", "{secret}"]
+''',
+    )
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+
+    def forbidden_policy(*args: object, **kwargs: object) -> None:
+        raise AssertionError("command policy must not receive a provider secret")
+
+    monkeypatch.setattr(runner.policy, "validate", forbidden_policy)
+
+    with pytest.raises(
+        VerificationConfigError, match="contains a host credential"
+    ) as captured:
+        load_verification_spec(guard, runner, known_secrets=(secret,))
+
+    assert secret not in str(captured.value)
+
+
+def test_provider_secret_is_rejected_from_config_path_before_resolution(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    secret = "provider-secret-for-test"
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+
+    def forbidden_resolution(*args: object, **kwargs: object) -> None:
+        raise AssertionError("config path reached WorkspaceGuard resolution")
+
+    monkeypatch.setattr(guard, "resolve_for_read", forbidden_resolution)
+
+    with pytest.raises(
+        VerificationConfigError, match="config path contains a host credential"
+    ) as captured:
+        load_verification_spec(
+            guard,
+            runner,
+            f"checks-{secret}.toml",
+            known_secrets=(secret,),
+        )
+
+    assert secret not in str(captured.value)
+
+
+@pytest.mark.parametrize(
+    "config_text",
+    [
+        '[verification]\nprotected_globs = ["tests/provider-secret-for-test/**"]\n',
+        "# provider-secret-for-test\n[verification]\nbaseline_policy = \"skip\"\n",
+        (
+            '[verification]\nprotected_globs = '
+            '["tests/provider-\\u0073ecret-for-test/**"]\n'
+        ),
+        (
+            '[verification]\n"field-provider-\\u0073ecret-for-test" = '
+            '"value"\n'
+        ),
+    ],
+)
+def test_provider_secret_anywhere_in_config_is_rejected_before_policy(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    config_text: str,
+) -> None:
+    secret = "provider-secret-for-test"
+    write_config(tmp_path, config_text)
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+
+    def forbidden_policy(*args: object, **kwargs: object) -> None:
+        raise AssertionError("credential-bearing config reached command policy")
+
+    monkeypatch.setattr(runner.policy, "validate", forbidden_policy)
+
+    with pytest.raises(
+        VerificationConfigError, match="config contains a host credential"
+    ) as captured:
+        load_verification_spec(guard, runner, known_secrets=(secret,))
+
+    assert secret not in str(captured.value)
+
+
 def test_config_path_must_be_workspace_relative(tmp_path: Path) -> None:
     guard = WorkspaceGuard(tmp_path)
     runner = CommandRunner(guard, CommandPolicy())

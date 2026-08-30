@@ -119,6 +119,87 @@ def test_single_tool_call_result_is_visible_to_next_model_turn() -> None:
     assert seen[0].content == "alpha"
 
 
+@pytest.mark.parametrize(
+    "secret_field",
+    ["text", "call_id", "tool_name", "arguments", "usage"],
+)
+def test_known_secret_model_response_is_rejected_before_history_or_tools(
+    secret_field: str,
+) -> None:
+    secret = "veriloop-provider-secret"
+    call = ToolCall(
+        id=f"call-{secret}" if secret_field == "call_id" else "safe-call",
+        name=f"read-{secret}" if secret_field == "tool_name" else "read",
+        arguments=(
+            {"path": f"prefix-{secret}-suffix"}
+            if secret_field == "arguments"
+            else {"path": "safe"}
+        ),
+    )
+    leaked_response = ModelResponse(
+        text=f"text-{secret}" if secret_field == "text" else "",
+        tool_calls=(() if secret_field == "text" else (call,)),
+        finish_reason=(
+            FinishReason.STOP
+            if secret_field == "text"
+            else FinishReason.TOOL_CALLS
+        ),
+        usage=({f"usage-{secret}": 1} if secret_field == "usage" else {}),
+    )
+    model = ScriptedModel([leaked_response])
+
+    class ForbiddenRegistry(ToolRegistry):
+        def execute(self, call: ToolCall):
+            raise AssertionError("known secret reached ToolRegistry.execute")
+
+    result = AgentLoop(
+        model,
+        ForbiddenRegistry(),
+        known_secrets=(secret,),
+    ).run("do not expose host credentials")
+
+    assert result.state is AgentState.FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.INVALID_ARGUMENTS
+    assert result.tool_call_count == 0
+    assert model.call_count == 1
+    assert [message.role for message in result.history] == [Role.SYSTEM, Role.USER]
+    assert secret not in repr(result)
+    assert secret not in repr(model.calls)
+
+
+def test_known_secret_task_and_tool_result_are_redacted_from_protocol_history() -> None:
+    secret = "veriloop-provider-secret"
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="observe",
+            description="Return a host credential to exercise protocol redaction",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "required": [],
+                "additionalProperties": False,
+            },
+            handler=lambda arguments: {"nested": [f"value-{secret}"]},
+        )
+    )
+    call = ToolCall(id="observe-one", name="observe", arguments={})
+    model = ScriptedModel([response("", call), response("safe final")])
+
+    result = AgentLoop(
+        model,
+        registry,
+        known_secrets=(secret,),
+    ).run(f"task containing {secret}")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert model.call_count == 2
+    assert secret not in repr(result)
+    assert secret not in repr(model.calls)
+    assert "[REDACTED]" in repr(result.history)
+
+
 def test_complete_three_turn_deterministic_trajectory() -> None:
     events: list[str] = []
     read_call = ToolCall(id="call-read", name="read", arguments={"path": "fixed"})

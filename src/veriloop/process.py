@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from contextlib import suppress
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import os
 from pathlib import Path, PureWindowsPath
 import signal
@@ -11,6 +11,7 @@ import subprocess
 import sys
 import tempfile
 import time
+from types import MappingProxyType
 from typing import BinaryIO, Iterable, Mapping
 
 from .filesystem import WorkspaceGuard
@@ -280,6 +281,9 @@ class CommandRunner:
     max_timeout_seconds: int = MAX_TIMEOUT_SECONDS
     output_limit_bytes: int = DEFAULT_OUTPUT_LIMIT_BYTES
     termination_grace_seconds: float = 0.5
+    child_environment: Mapping[str, str] = field(
+        default_factory=lambda: host_child_environment(os.environ)
+    )
 
     def __post_init__(self) -> None:
         if self.max_timeout_seconds < 1:
@@ -288,6 +292,14 @@ class CommandRunner:
             raise ValueError("output_limit_bytes must be at least 256")
         if self.termination_grace_seconds <= 0:
             raise ValueError("termination_grace_seconds must be positive")
+        if any(
+            not isinstance(name, str) or not isinstance(value, str)
+            for name, value in self.child_environment.items()
+        ):
+            raise ValueError("child environment must contain only string pairs")
+        self.child_environment = MappingProxyType(
+            host_child_environment(self.child_environment)
+        )
 
     def __call__(self, arguments: dict[str, object]) -> dict[str, object]:
         return self.run(
@@ -311,7 +323,7 @@ class CommandRunner:
             cwd=cwd_path,
             workspace_root=self.guard.root,
         )
-        environment = filtered_subprocess_environment(os.environ)
+        environment = filtered_subprocess_environment(self.child_environment)
         started = time.monotonic()
 
         with tempfile.TemporaryFile(mode="w+b") as stdout_file, tempfile.TemporaryFile(
@@ -454,6 +466,33 @@ def filtered_subprocess_environment(
             continue
         filtered[name] = source[name]
     return filtered
+
+
+def host_child_environment(
+    source: Mapping[str, str],
+    known_secrets: Iterable[str] = (),
+) -> dict[str, str]:
+    """Prepare a frozen child environment before it reaches CommandRunner."""
+
+    secrets = {
+        secret
+        for secret in known_secrets
+        if isinstance(secret, str) and secret
+    }
+    for name in source:
+        normalized = name.upper()
+        if any(word in normalized for word in _SENSITIVE_ENVIRONMENT_WORDS):
+            value = source[name]
+            if value:
+                secrets.add(value)
+    filtered = filtered_subprocess_environment(source)
+    if not secrets:
+        return filtered
+    return {
+        name: value
+        for name, value in filtered.items()
+        if not any(secret in value for secret in secrets)
+    }
 
 
 def _process_group_options() -> dict[str, object]:

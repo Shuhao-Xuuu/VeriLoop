@@ -120,6 +120,41 @@ class ToolRegistry:
         )
 
 
+def contains_known_secret(value: Any, known_secrets: Iterable[str]) -> bool:
+    """Detect an exact host credential before a value reaches tool execution."""
+
+    secrets = tuple(
+        secret
+        for secret in known_secrets
+        if isinstance(secret, str) and secret
+    )
+    if not secrets:
+        return False
+    pending = [value]
+    seen_containers: set[int] = set()
+    while pending:
+        item = pending.pop()
+        if isinstance(item, str):
+            if any(secret in item for secret in secrets):
+                return True
+            continue
+        if isinstance(item, dict):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            pending.extend(item.keys())
+            pending.extend(item.values())
+            continue
+        if isinstance(item, (list, tuple)):
+            identity = id(item)
+            if identity in seen_containers:
+                continue
+            seen_containers.add(identity)
+            pending.extend(item)
+    return False
+
+
 def register_filesystem_tools(
     registry: ToolRegistry,
     guard: WorkspaceGuard,
