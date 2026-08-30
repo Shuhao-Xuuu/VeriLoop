@@ -337,6 +337,7 @@ class CommandRunner:
                         "argv": list(command),
                         "cwd": self.guard.relative(cwd_path),
                         "duration_ms": duration_ms,
+                        "started": False,
                     },
                 ) from exc
 
@@ -364,12 +365,14 @@ class CommandRunner:
                 ErrorKind.COMMAND_TIMEOUT,
                 f"command exceeded the {timeout}-second timeout",
                 metadata=result,
+                invalidates_verification=True,
             )
         if process.returncode != 0:
             raise ToolExecutionError(
                 ErrorKind.COMMAND_NONZERO_EXIT,
                 f"command exited with code {process.returncode}",
                 metadata=result,
+                invalidates_verification=True,
             )
         return result
 
@@ -433,6 +436,7 @@ class CommandRunner:
             "stderr_truncated": stderr_truncated,
             "stdout_total_bytes": stdout_total,
             "stderr_total_bytes": stderr_total,
+            "started": True,
         }
 
 

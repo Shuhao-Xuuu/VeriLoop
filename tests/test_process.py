@@ -75,6 +75,8 @@ def test_run_command_exit_zero_stdout_and_stderr(tmp_path: Path) -> None:
     assert data["stderr_total_bytes"] == len(data["stderr"].encode())
     assert data["stdout_truncated"] is False
     assert data["stderr_truncated"] is False
+    assert data["started"] is True
+    assert result.invalidates_verification is True
     assert isinstance(data["duration_ms"], int) and data["duration_ms"] >= 0
 
 
@@ -100,6 +102,8 @@ def test_nonzero_exit_is_structured_tool_result(tmp_path: Path) -> None:
     assert result.call_id == "nonzero-7"
     assert result.metadata["exit_code"] == 7
     assert result.metadata["stderr"].splitlines() == ["failure detail"]
+    assert result.metadata["started"] is True
+    assert result.invalidates_verification is True
     assert data["error_kind"] == "command_nonzero_exit"
     assert data["details"]["exit_code"] == 7
 
@@ -137,6 +141,8 @@ while True:
     assert result.error_kind is ErrorKind.COMMAND_TIMEOUT
     assert result.metadata["exit_code"] is not None
     assert result.metadata["duration_ms"] >= 1000
+    assert result.metadata["started"] is True
+    assert result.invalidates_verification is True
     assert heartbeat.stat().st_size == size_after_return
     assert (workspace / "pid.txt").read_text(encoding="utf-8").isdigit()
 
@@ -507,6 +513,8 @@ def test_start_error_becomes_command_start_error(tmp_path: Path, monkeypatch) ->
     result = execute(registry, {"argv": [sys.executable, "ok.py"]})
 
     assert result.error_kind is ErrorKind.COMMAND_START_ERROR
+    assert result.metadata["started"] is False
+    assert result.invalidates_verification is False
     assert "Traceback" not in result.content
     assert "fictional start failure" not in result.content
 

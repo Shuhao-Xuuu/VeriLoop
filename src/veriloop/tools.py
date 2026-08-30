@@ -28,11 +28,13 @@ class ToolExecutionError(RuntimeError):
         *,
         retryable: bool = False,
         metadata: dict[str, Any] | None = None,
+        invalidates_verification: bool = False,
     ) -> None:
         super().__init__(message)
         self.kind = kind
         self.retryable = retryable
         self.metadata = dict(metadata or {})
+        self.invalidates_verification = invalidates_verification
 
 
 @dataclass(frozen=True, slots=True)
@@ -97,6 +99,9 @@ class ToolRegistry:
                 str(exc),
                 retryable=exc.retryable,
                 metadata=exc.metadata,
+                invalidates_verification=(
+                    spec.mutates_workspace and exc.invalidates_verification
+                ),
             )
         except Exception as exc:
             return _tool_failure(
@@ -110,6 +115,7 @@ class ToolRegistry:
             tool_name=call.name,
             ok=True,
             content=_stringify_result(value),
+            invalidates_verification=spec.mutates_workspace,
         )
 
 
@@ -271,6 +277,7 @@ def register_process_tool(registry: ToolRegistry, runner: CommandRunner) -> None
                 "additionalProperties": False,
             },
             handler=runner,
+            mutates_workspace=True,
         )
     )
 
@@ -312,6 +319,7 @@ def _tool_failure(
     *,
     retryable: bool = False,
     metadata: dict[str, Any] | None = None,
+    invalidates_verification: bool = False,
 ) -> ToolResult:
     details = dict(metadata or {})
     return ToolResult(
@@ -329,6 +337,7 @@ def _tool_failure(
         error_kind=kind,
         retryable=retryable,
         metadata=details,
+        invalidates_verification=invalidates_verification,
     )
 
 

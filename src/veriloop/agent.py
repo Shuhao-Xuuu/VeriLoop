@@ -47,13 +47,15 @@ class AgentLoop:
         ]
         step_count = 0
         tool_call_count = 0
+        mutation_seq = 0
+        verified_seq = None
         baseline_verification = None
 
         if self._verification_gate is not None:
             state = AgentState.BASELINE_VERIFYING
             try:
                 baseline_verification = self._verification_gate.run_baseline(
-                    mutation_seq=0
+                    mutation_seq=mutation_seq
                 )
             except KeyboardInterrupt:
                 state = AgentState.CANCELLED
@@ -67,6 +69,8 @@ class AgentLoop:
                         kind=ErrorKind.CANCELLED,
                         message="agent run cancelled during baseline verification",
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                 )
             except Exception as exc:
                 state = AgentState.FAILED
@@ -83,6 +87,8 @@ class AgentLoop:
                             f"{type(exc).__name__}: {exc}"
                         ),
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                 )
             if not baseline_verification.passed:
                 state = AgentState.FAILED
@@ -100,6 +106,8 @@ class AgentLoop:
                         kind=failure_kind,
                         message=f"baseline verification failed: {failure_kind.value}",
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
 
@@ -116,6 +124,8 @@ class AgentLoop:
                         kind=ErrorKind.MAX_STEPS,
                         message=f"maximum model steps reached: {self._max_steps}",
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
 
@@ -138,6 +148,8 @@ class AgentLoop:
                         kind=ErrorKind.CANCELLED,
                         message="agent run cancelled",
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
             except ModelClientError as exc:
@@ -153,6 +165,8 @@ class AgentLoop:
                         message=str(exc),
                         retryable=exc.retryable,
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
             except Exception as exc:
@@ -167,6 +181,8 @@ class AgentLoop:
                         kind=ErrorKind.INTERNAL_ERROR,
                         message=f"unexpected model error: {type(exc).__name__}: {exc}",
                     ),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
 
@@ -186,6 +202,8 @@ class AgentLoop:
                     step_count=step_count,
                     tool_call_count=tool_call_count,
                     history=tuple(history),
+                    mutation_seq=mutation_seq,
+                    verified_seq=verified_seq,
                     baseline_verification=baseline_verification,
                 )
 
@@ -205,9 +223,14 @@ class AgentLoop:
                             kind=ErrorKind.CANCELLED,
                             message="agent run cancelled during tool execution",
                         ),
+                        mutation_seq=mutation_seq,
+                        verified_seq=verified_seq,
                         baseline_verification=baseline_verification,
                     )
                 tool_call_count += 1
+                if result.invalidates_verification:
+                    mutation_seq += 1
+                    verified_seq = None
                 history.append(
                     Message(
                         role=Role.TOOL,

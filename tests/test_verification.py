@@ -24,7 +24,11 @@ from veriloop.protocol import (
 )
 from veriloop.filesystem import WorkspaceGuard
 from veriloop.process import CommandPolicy, CommandRunner
-from veriloop.tools import ToolRegistry, register_filesystem_tools
+from veriloop.tools import (
+    ToolRegistry,
+    register_filesystem_tools,
+    register_workspace_tools,
+)
 from veriloop.verification import (
     BaselinePolicy,
     VerificationConfigError,
@@ -60,6 +64,14 @@ def final_response(text: str = "done") -> ModelResponse:
         text=text,
         tool_calls=(),
         finish_reason=FinishReason.STOP,
+    )
+
+
+def tool_response(*calls: ToolCall) -> ModelResponse:
+    return ModelResponse(
+        text="",
+        tool_calls=tuple(calls),
+        finish_reason=FinishReason.TOOL_CALLS,
     )
 
 
@@ -711,3 +723,216 @@ def test_existing_config_is_denied_to_edit_and_overwrite_tools(tmp_path: Path) -
     assert edit.error_kind is ErrorKind.PATH_WRITE_DENIED
     assert overwrite.error_kind is ErrorKind.PATH_WRITE_DENIED
     assert (tmp_path / ".veriloop.toml").read_bytes() == original
+
+
+def test_read_list_and_search_do_not_advance_mutation_sequence(tmp_path: Path) -> None:
+    (tmp_path / "value.txt").write_text("alpha\n", encoding="utf-8")
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    calls = (
+        ToolCall(id="list", name="list_files", arguments={}),
+        ToolCall(id="read", name="read_file", arguments={"path": "value.txt"}),
+        ToolCall(id="search", name="search_text", arguments={"query": "alpha"}),
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(*calls), final_response()]),
+        registry,
+    ).run("inspect")
+
+    assert result.mutation_seq == 0
+    assert result.verified_seq is None
+
+
+def test_successful_edit_create_and_overwrite_each_advance_mutation_sequence(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "value.txt"
+    original = b"value = 1\n"
+    created = b"first\n"
+    target.write_bytes(original)
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    calls = (
+        ToolCall(
+            id="edit",
+            name="edit_file",
+            arguments={
+                "path": "value.txt",
+                "old_text": "value = 1",
+                "new_text": "value = 2",
+                "expected_sha256": hashlib.sha256(original).hexdigest(),
+            },
+        ),
+        ToolCall(
+            id="create",
+            name="write_file",
+            arguments={
+                "path": "created.txt",
+                "content": created.decode(),
+                "mode": "create",
+            },
+        ),
+        ToolCall(
+            id="overwrite",
+            name="write_file",
+            arguments={
+                "path": "created.txt",
+                "content": "second\n",
+                "mode": "overwrite",
+                "expected_sha256": hashlib.sha256(created).hexdigest(),
+            },
+        ),
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(*calls), final_response()]),
+        registry,
+    ).run("mutate")
+
+    assert result.mutation_seq == 3
+    assert result.verified_seq is None
+    assert target.read_text(encoding="utf-8") == "value = 2\n"
+    assert (tmp_path / "created.txt").read_text(encoding="utf-8") == "second\n"
+
+
+def test_failed_edit_and_denied_command_do_not_advance_mutation_sequence(
+    tmp_path: Path,
+) -> None:
+    target = tmp_path / "value.txt"
+    target.write_text("value = 1\n", encoding="utf-8")
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    calls = (
+        ToolCall(
+            id="stale",
+            name="edit_file",
+            arguments={
+                "path": "value.txt",
+                "old_text": "value = 1",
+                "new_text": "value = 2",
+                "expected_sha256": "0" * 64,
+            },
+        ),
+        ToolCall(
+            id="denied",
+            name="run_command",
+            arguments={"argv": ["pip", "install", "fictional"]},
+        ),
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(*calls), final_response()]),
+        registry,
+    ).run("do not mutate")
+
+    assert result.mutation_seq == 0
+    assert target.read_text(encoding="utf-8") == "value = 1\n"
+
+
+@pytest.mark.parametrize("exit_code", [0, 5])
+def test_started_command_advances_mutation_for_zero_and_nonzero_exit(
+    tmp_path: Path,
+    exit_code: int,
+) -> None:
+    (tmp_path / "command.py").write_text(
+        f"raise SystemExit({exit_code})\n",
+        encoding="utf-8",
+    )
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    call = ToolCall(
+        id="command",
+        name="run_command",
+        arguments={"argv": ["python", "command.py"]},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(call), final_response()]),
+        registry,
+    ).run("run")
+
+    assert result.mutation_seq == 1
+    assert result.verified_seq is None
+
+
+def test_timed_out_started_command_advances_mutation_sequence(tmp_path: Path) -> None:
+    (tmp_path / "slow.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    call = ToolCall(
+        id="timeout",
+        name="run_command",
+        arguments={
+            "argv": ["python", "slow.py"],
+            "timeout_seconds": 1,
+        },
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(call), final_response()]),
+        registry,
+    ).run("run")
+
+    assert result.mutation_seq == 1
+
+
+def test_command_start_error_does_not_advance_mutation_sequence(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "command.py").write_text("print('never')\n", encoding="utf-8")
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    call = ToolCall(
+        id="start-error",
+        name="run_command",
+        arguments={"argv": ["python", "command.py"]},
+    )
+
+    def fail_to_start(*args, **kwargs):
+        raise OSError("fictional start failure")
+
+    monkeypatch.setattr("veriloop.process.subprocess.Popen", fail_to_start)
+    result = AgentLoop(
+        ScriptedModel([tool_response(call), final_response()]),
+        registry,
+    ).run("run")
+
+    assert result.mutation_seq == 0
+
+
+def test_model_run_pytest_success_never_sets_verified_sequence(tmp_path: Path) -> None:
+    (tmp_path / "test_sample.py").write_text(
+        "def test_sample():\n    assert True\n",
+        encoding="utf-8",
+    )
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    call = ToolCall(
+        id="self-test",
+        name="run_command",
+        arguments={"argv": ["python", "-m", "pytest", "-q"]},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(call), final_response("tests pass")]),
+        registry,
+    ).run("run tests")
+
+    assert result.mutation_seq == 1
+    assert result.verified_seq is None
+    assert result.state is AgentState.COMPLETED_UNVERIFIED

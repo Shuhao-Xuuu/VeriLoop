@@ -79,6 +79,7 @@ class ToolResult:
     error_kind: ErrorKind | None = None
     retryable: bool = False
     metadata: dict[str, Any] = field(default_factory=dict)
+    invalidates_verification: bool = False
 
 
 @dataclass(frozen=True, slots=True)

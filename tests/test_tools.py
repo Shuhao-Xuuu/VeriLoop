@@ -3,7 +3,7 @@ from __future__ import annotations
 import pytest
 
 from veriloop.protocol import ErrorKind, ToolCall
-from veriloop.tools import ToolRegistry, ToolSpec
+from veriloop.tools import ToolExecutionError, ToolRegistry, ToolSpec
 
 
 def schema(**properties: dict[str, str]) -> dict[str, object]:
@@ -197,3 +197,54 @@ def test_additional_properties_can_be_explicitly_allowed() -> None:
     )
 
     assert result.ok is True
+
+
+def test_registry_marks_only_successful_mutating_specs_as_invalidating() -> None:
+    registry = ToolRegistry()
+    registry.register(
+        ToolSpec(
+            name="mutate",
+            description="Test mutation fact",
+            input_schema=schema(value={"type": "string"}),
+            handler=lambda arguments: "changed",
+            mutates_workspace=True,
+        )
+    )
+
+    success = registry.execute(
+        ToolCall(id="success", name="mutate", arguments={"value": "x"})
+    )
+    invalid = registry.execute(
+        ToolCall(id="invalid", name="mutate", arguments={})
+    )
+
+    assert success.invalidates_verification is True
+    assert invalid.invalidates_verification is False
+
+
+def test_registry_preserves_host_reported_mutation_on_expected_failure() -> None:
+    registry = ToolRegistry()
+
+    def fail_after_start(arguments):
+        raise ToolExecutionError(
+            ErrorKind.COMMAND_NONZERO_EXIT,
+            "started then failed",
+            invalidates_verification=True,
+        )
+
+    registry.register(
+        ToolSpec(
+            name="mutate",
+            description="Test mutation fact",
+            input_schema=schema(value={"type": "string"}),
+            handler=fail_after_start,
+            mutates_workspace=True,
+        )
+    )
+
+    result = registry.execute(
+        ToolCall(id="failed", name="mutate", arguments={"value": "x"})
+    )
+
+    assert result.ok is False
+    assert result.invalidates_verification is True
