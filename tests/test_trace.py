@@ -3,6 +3,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 import hashlib
 import json
+import os
 from pathlib import Path
 from typing import Any
 
@@ -39,6 +40,7 @@ from veriloop.tools import (
     register_workspace_tools,
 )
 from veriloop.trace import (
+    PATCH_DIFF_LIMIT_BYTES,
     REDACTION_MARKER,
     TRACE_TEXT_PREVIEW_CHARS,
     TRACE_TRUNCATION_MARKER,
@@ -62,13 +64,18 @@ def fixed_time() -> datetime:
     return FIXED_TIME
 
 
-def response(text: str = "", *calls: ToolCall) -> ModelResponse:
+def response(
+    text: str = "",
+    *calls: ToolCall,
+    usage: dict[str, int] | None = None,
+) -> ModelResponse:
     return ModelResponse(
         text=text,
         tool_calls=tuple(calls),
         finish_reason=(
             FinishReason.TOOL_CALLS if calls else FinishReason.STOP
         ),
+        usage=dict(usage or {}),
     )
 
 
@@ -111,6 +118,65 @@ class FailingTraceStream:
 
     def close(self) -> None:
         self.closed = True
+
+
+class RecordingArtifactRunner:
+    def __init__(
+        self,
+        diff: str,
+        *,
+        diff_truncated: bool = False,
+        diff_error: ErrorKind | None = None,
+        repository_error: ErrorKind | None = None,
+        diff_total_bytes: int | None = None,
+    ) -> None:
+        self.diff = diff
+        self.diff_truncated = diff_truncated
+        self.diff_error = diff_error
+        self.repository_error = repository_error
+        self.diff_total_bytes = diff_total_bytes
+        self.calls: list[tuple[list[str], str, int]] = []
+
+    def run(
+        self,
+        argv: object,
+        *,
+        cwd: object = ".",
+        timeout_seconds: object = 60,
+    ) -> dict[str, object]:
+        assert isinstance(argv, list)
+        assert isinstance(cwd, str)
+        assert isinstance(timeout_seconds, int)
+        self.calls.append((argv, cwd, timeout_seconds))
+        if argv[1] == "rev-parse":
+            if self.repository_error is not None:
+                raise ToolExecutionError(
+                    self.repository_error,
+                    "safe simulated repository result",
+                )
+            return {"stdout": "true\n", "stdout_truncated": False}
+        if self.diff_error is not None:
+            raise ToolExecutionError(self.diff_error, "safe simulated Git failure")
+        return {
+            "stdout": self.diff,
+            "stdout_truncated": self.diff_truncated,
+            "stdout_total_bytes": (
+                self.diff_total_bytes
+                if self.diff_total_bytes is not None
+                else len(self.diff.encode("utf-8"))
+            ),
+        }
+
+
+class InterruptingArtifactRunner:
+    def run(
+        self,
+        argv: object,
+        *,
+        cwd: object = ".",
+        timeout_seconds: object = 60,
+    ) -> dict[str, object]:
+        raise KeyboardInterrupt
 
 
 def provider_response(text: str = "done") -> dict[str, object]:
@@ -377,19 +443,35 @@ def test_tool_output_and_verification_streams_are_bounded(tmp_path: Path) -> Non
 
 def test_plain_final_agent_lifecycle_is_redacted_and_finished(tmp_path: Path) -> None:
     secret = "veriloop-test-secret-value"
+    artifact_runner = RecordingArtifactRunner(
+        "",
+        repository_error=ErrorKind.COMMAND_NONZERO_EXIT,
+    )
     writer = TraceWriter(
         tmp_path,
         run_id="plain-final",
         known_secrets=(secret,),
         timestamp_factory=fixed_time,
+        artifact_runner=artifact_runner,
     )
-    model = ScriptedModel([response(f"finished {secret}")])
+    model = ScriptedModel(
+        [
+            response(
+                f"finished {secret}",
+                usage={"input_tokens": 7, "output_tokens": 3},
+            )
+        ]
+    )
 
     result = AgentLoop(model, ToolRegistry(), trace_writer=writer).run("task")
 
     assert result.state is AgentState.COMPLETED_UNVERIFIED
     assert result.run_id == "plain-final"
     assert result.trace_path == ".veriloop/runs/plain-final/events.jsonl"
+    assert result.result_path == ".veriloop/runs/plain-final/result.json"
+    assert result.patch_path is None
+    assert result.duration_ms >= 0
+    assert result.model_usage == {"input_tokens": 7, "output_tokens": 3}
     types = event_types(writer.events_path)
     assert types[0] == "run_started"
     assert "model_request_started" in types
@@ -400,6 +482,368 @@ def test_plain_final_agent_lifecycle_is_redacted_and_finished(tmp_path: Path) ->
     assert read_events(writer.events_path)[-1]["state"] == (
         AgentState.COMPLETED_UNVERIFIED.value
     )
+    raw_result = writer.result_path.read_text(encoding="utf-8")
+    assert secret not in raw_result
+    artifact = json.loads(raw_result)
+    assert {
+        "schema_version",
+        "run_id",
+        "state",
+        "final_message",
+        "step_count",
+        "tool_call_count",
+        "mutation_seq",
+        "verified_seq",
+        "repair_rounds_used",
+        "baseline",
+        "final_verification",
+        "protected_unchanged",
+        "protected_changes",
+        "changed_files",
+        "trace_path",
+        "result_path",
+        "patch_path",
+        "duration_ms",
+        "model_usage",
+        "error_kind",
+        "error_message",
+    } <= set(artifact)
+    assert artifact["schema_version"] == 1
+    assert artifact["run_id"] == result.run_id
+    assert artifact["state"] == result.state.value
+    assert artifact["final_message"] == f"finished {REDACTION_MARKER}"
+    assert artifact["step_count"] == result.step_count
+    assert artifact["tool_call_count"] == result.tool_call_count
+    assert artifact["mutation_seq"] == result.mutation_seq
+    assert artifact["verified_seq"] == result.verified_seq
+    assert artifact["repair_rounds_used"] == result.repair_rounds_used
+    assert artifact["baseline"] is None
+    assert artifact["final_verification"] is None
+    assert artifact["protected_unchanged"] is None
+    assert artifact["protected_changes"] == []
+    assert artifact["changed_files"] == []
+    assert artifact["trace_path"] == result.trace_path
+    assert artifact["result_path"] == result.result_path
+    assert artifact["patch_path"] is None
+    assert artifact["patch"] == {
+        "available": False,
+        "error_kind": None,
+        "status": "not_git",
+        "truncated": False,
+    }
+    assert artifact["duration_ms"] == result.duration_ms
+    assert artifact["model_usage"] == result.model_usage
+    assert artifact["error_kind"] is None
+    assert artifact["error_message"] is None
+    original_result = writer.result_path.read_bytes()
+    repeated = writer.write_artifacts(result)
+    assert repeated.result_path is None
+    assert writer.result_path.read_bytes() == original_result
+
+
+def test_git_patch_and_result_are_redacted_and_match_agent_result(
+    tmp_path: Path,
+) -> None:
+    secret = "veriloop-test-secret-value"
+    original = b"old value\n"
+    target = tmp_path / "value.txt"
+    target.write_bytes(original)
+    patch_runner = RecordingArtifactRunner(
+        "diff --git a/value.txt b/value.txt\n"
+        "--- a/value.txt\n"
+        "+++ b/value.txt\n"
+        "@@ -1 +1 @@\n"
+        "-old value\n"
+        f"+new {secret} Authorization: Bearer opaque-patch-token\n"
+    )
+
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    write = ToolCall(
+        id="write-secret",
+        name="write_file",
+        arguments={
+            "path": "value.txt",
+            "content": f"new {secret}\n",
+            "mode": "overwrite",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    model = ScriptedModel(
+        [
+            response("", write, usage={"input_tokens": 2, "output_tokens": 1}),
+            response(
+                "done Authorization: Bearer opaque-result-token",
+                usage={"input_tokens": 3, "output_tokens": 2},
+            ),
+        ]
+    )
+    writer = TraceWriter(
+        tmp_path,
+        run_id="git-artifacts",
+        known_secrets=(secret,),
+        artifact_runner=patch_runner,
+    )
+
+    result = AgentLoop(model, registry, trace_writer=writer).run("change value")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.changed_files == ("value.txt",)
+    assert result.model_usage == {"input_tokens": 5, "output_tokens": 3}
+    assert result.patch_path == ".veriloop/runs/git-artifacts/patch.diff"
+    patch = writer.patch_path.read_text(encoding="utf-8")
+    assert secret not in patch
+    assert "opaque-patch-token" not in patch
+    assert REDACTION_MARKER in patch
+    assert "diff --git a/value.txt b/value.txt" in patch
+    assert patch_runner.calls == [
+        (
+            ["git", "rev-parse", "--is-inside-work-tree"],
+            ".",
+            30,
+        ),
+        (
+            [
+                "git",
+                "diff",
+                "--no-color",
+                "--no-ext-diff",
+                "--no-textconv",
+                "--",
+                ".",
+            ],
+            ".",
+            30,
+        ),
+    ]
+
+    raw_result = writer.result_path.read_text(encoding="utf-8")
+    assert secret not in raw_result
+    assert "opaque-result-token" not in raw_result
+    artifact = json.loads(raw_result)
+    assert artifact["state"] == result.state.value
+    assert artifact["changed_files"] == ["value.txt"]
+    assert artifact["model_usage"] == result.model_usage
+    assert artifact["patch_path"] == result.patch_path
+    assert artifact["patch"] == {
+        "available": True,
+        "error_kind": None,
+        "redacted": True,
+        "status": "written",
+        "truncated": False,
+    }
+
+
+@pytest.mark.parametrize(
+    ("runner", "expected_status", "expected_error_kind", "truncated"),
+    [
+        (RecordingArtifactRunner(""), "no_changes", None, False),
+        (
+            RecordingArtifactRunner("partial", diff_truncated=True),
+            "git_diff_truncated",
+            None,
+            True,
+        ),
+        (
+            RecordingArtifactRunner("x" * (PATCH_DIFF_LIMIT_BYTES + 1)),
+            "git_diff_truncated",
+            None,
+            True,
+        ),
+        (
+            RecordingArtifactRunner(
+                "partial",
+                diff_total_bytes=PATCH_DIFF_LIMIT_BYTES + 1,
+            ),
+            "git_diff_truncated",
+            None,
+            True,
+        ),
+        (
+            RecordingArtifactRunner(
+                "",
+                diff_error=ErrorKind.COMMAND_START_ERROR,
+            ),
+            "git_diff_failed",
+            ErrorKind.COMMAND_START_ERROR.value,
+            False,
+        ),
+    ],
+)
+def test_incomplete_git_diff_never_becomes_a_patch(
+    tmp_path: Path,
+    runner: RecordingArtifactRunner,
+    expected_status: str,
+    expected_error_kind: str | None,
+    truncated: bool,
+) -> None:
+    writer = TraceWriter(
+        tmp_path,
+        run_id=expected_status,
+        artifact_runner=runner,
+    )
+
+    result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.patch_path is None
+    assert not writer.patch_path.exists()
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["patch"]["available"] is False
+    assert artifact["patch"]["status"] == expected_status
+    assert artifact["patch"]["error_kind"] == expected_error_kind
+    assert artifact["patch"]["truncated"] is truncated
+
+
+def test_artifact_targets_are_never_overwritten(tmp_path: Path) -> None:
+    patch_runner = RecordingArtifactRunner("diff content\n")
+    writer = TraceWriter(
+        tmp_path,
+        run_id="artifact-no-clobber",
+        artifact_runner=patch_runner,
+    )
+    writer.patch_path.write_text("existing patch\n", encoding="utf-8")
+
+    result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.result_path == ".veriloop/runs/artifact-no-clobber/result.json"
+    assert result.patch_path is None
+    assert writer.patch_path.read_text(encoding="utf-8") == "existing patch\n"
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["patch"]["status"] == "patch_write_failed"
+
+    second = TraceWriter(tmp_path, run_id="result-no-clobber")
+    second.result_path.write_text("existing result\n", encoding="utf-8")
+    second_result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=second,
+    ).run("task")
+    assert second_result.result_path is None
+    assert second.result_path.read_text(encoding="utf-8") == "existing result\n"
+    assert not list(second.run_dir.glob("*.tmp"))
+
+    third = TraceWriter(
+        tmp_path,
+        run_id="patch-with-result-failure",
+        artifact_runner=RecordingArtifactRunner("diff content\n"),
+    )
+    third.result_path.write_text("existing result\n", encoding="utf-8")
+    third_result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=third,
+    ).run("task")
+    assert third_result.result_path is None
+    assert third_result.patch_path == (
+        ".veriloop/runs/patch-with-result-failure/patch.diff"
+    )
+    assert third.patch_path.read_text(encoding="utf-8") == "diff content\n"
+    assert third.result_path.read_text(encoding="utf-8") == "existing result\n"
+
+
+def test_artifact_interrupt_cannot_replace_a_finished_agent_result(
+    tmp_path: Path,
+) -> None:
+    writer = TraceWriter(
+        tmp_path,
+        run_id="artifact-interrupt",
+        artifact_runner=InterruptingArtifactRunner(),
+    )
+
+    result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.final_message == "done"
+    assert result.result_path is None
+    assert result.patch_path is None
+    assert event_types(writer.events_path)[-1] == "run_finished"
+
+
+def test_atomic_artifact_install_race_preserves_the_winning_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = TraceWriter(
+        tmp_path,
+        run_id="artifact-install-race",
+        artifact_runner=RecordingArtifactRunner(
+            "",
+            repository_error=ErrorKind.COMMAND_NONZERO_EXIT,
+        ),
+    )
+
+    def collide(source: object, target: object) -> None:
+        Path(target).write_text("winning file\n", encoding="utf-8")
+        raise FileExistsError("simulated install race")
+
+    install_name = "rename" if os.name == "nt" else "link"
+    monkeypatch.setattr(f"veriloop.trace.os.{install_name}", collide)
+
+    result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.result_path is None
+    assert writer.result_path.read_text(encoding="utf-8") == "winning file\n"
+    assert not list(writer.run_dir.glob("*.tmp"))
+
+
+def test_atomic_install_interrupt_reports_artifacts_that_were_fully_installed(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    writer = TraceWriter(
+        tmp_path,
+        run_id="artifact-install-interrupt",
+        artifact_runner=RecordingArtifactRunner("diff content\n"),
+    )
+    install_name = "rename" if os.name == "nt" else "link"
+    original_install = getattr(os, install_name)
+
+    def install_then_interrupt(source: object, target: object) -> None:
+        original_install(source, target)
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(
+        f"veriloop.trace.os.{install_name}",
+        install_then_interrupt,
+    )
+
+    result = AgentLoop(
+        ScriptedModel([response("done")]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.patch_path == (
+        ".veriloop/runs/artifact-install-interrupt/patch.diff"
+    )
+    assert result.result_path == (
+        ".veriloop/runs/artifact-install-interrupt/result.json"
+    )
+    assert writer.patch_path.read_text(encoding="utf-8") == "diff content\n"
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["patch_path"] == result.patch_path
+    assert not list(writer.run_dir.glob("*.tmp"))
 
 
 def test_tool_events_and_workspace_revision_are_recorded_once(tmp_path: Path) -> None:
@@ -751,6 +1195,46 @@ def test_retry_exhaustion_emits_two_retries_then_run_failed(tmp_path: Path) -> N
     assert types.count("provider_retry") == 2
     assert types[-2:] == ["run_failed", "run_finished"]
     assert secret not in writer.events_path.read_text(encoding="utf-8")
+    raw_result = writer.result_path.read_text(encoding="utf-8")
+    assert secret not in raw_result
+    artifact = json.loads(raw_result)
+    assert artifact["state"] == AgentState.FAILED.value
+    assert artifact["error_kind"] == ErrorKind.PROVIDER_RETRY_EXHAUSTED.value
+    assert artifact["error_message"] is not None
+
+
+def test_model_usage_is_kept_when_response_protocol_validation_fails(
+    tmp_path: Path,
+) -> None:
+    duplicate_calls = (
+        ToolCall(id="duplicate", name="unknown", arguments={}),
+        ToolCall(id="duplicate", name="unknown", arguments={}),
+    )
+    writer = TraceWriter(
+        tmp_path,
+        run_id="duplicate-usage",
+        artifact_runner=RecordingArtifactRunner(
+            "",
+            repository_error=ErrorKind.COMMAND_NONZERO_EXIT,
+        ),
+    )
+    model_response = ModelResponse(
+        text="",
+        tool_calls=duplicate_calls,
+        finish_reason=FinishReason.TOOL_CALLS,
+        usage={"input_tokens": 11, "output_tokens": 4},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([model_response]),
+        ToolRegistry(),
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.FAILED
+    assert result.model_usage == {"input_tokens": 11, "output_tokens": 4}
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["model_usage"] == result.model_usage
 
 
 @pytest.mark.parametrize(
@@ -839,6 +1323,8 @@ argv = ["python", "verify.py"]
     assert result.mutation_seq == 1
     assert result.verified_seq == 1
     assert result.repair_rounds_used == 1
+    assert result.changed_files == ("value.txt",)
+    assert result.result_path == ".veriloop/runs/recovery/result.json"
     events = read_events(writer.events_path)
     types = [event["event_type"] for event in events]
     assert "baseline_started" in types
@@ -862,6 +1348,16 @@ argv = ["python", "verify.py"]
     ] == [False, True]
     assert result.final_verification is not None
     assert result.final_verification.protected_unchanged is True
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["state"] == AgentState.VERIFIED.value
+    assert artifact["mutation_seq"] == 1
+    assert artifact["verified_seq"] == 1
+    assert artifact["repair_rounds_used"] == 1
+    assert artifact["baseline"]["skipped"] is True
+    assert artifact["final_verification"]["passed"] is True
+    assert artifact["protected_unchanged"] is True
+    assert artifact["protected_changes"] == []
+    assert artifact["changed_files"] == ["value.txt"]
 
 
 def test_trace_metadata_is_excluded_from_wildcard_protection(tmp_path: Path) -> None:

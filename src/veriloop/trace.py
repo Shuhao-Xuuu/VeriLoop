@@ -3,30 +3,40 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
+from dataclasses import replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
+import tempfile
 from typing import Any, TextIO
 import uuid
 
-from .filesystem import is_link_like
+from .filesystem import WorkspaceGuard, is_link_like
+from .process import DEFAULT_OUTPUT_LIMIT_BYTES, CommandPolicy, CommandRunner
 from .protocol import (
+    AgentResult,
     AgentState,
+    ErrorKind,
     Message,
     ModelResponse,
     ToolCall,
     ToolResult,
     VerificationResult,
 )
+from .tools import ToolExecutionError
 
 
 TRACE_SCHEMA_VERSION = 1
+RESULT_SCHEMA_VERSION = 1
 TRACE_TEXT_PREVIEW_CHARS = 2_048
 TRACE_GENERIC_STRING_CHARS = 4_096
 TRACE_MAX_COLLECTION_ITEMS = 100
+PATCH_DIFF_LIMIT_BYTES = DEFAULT_OUTPUT_LIMIT_BYTES
+PATCH_GIT_TIMEOUT_SECONDS = 30
 TRACE_TRUNCATION_MARKER = "...[veriloop trace truncated]..."
 REDACTION_MARKER = "[REDACTED]"
 _RUN_ID_PATTERN = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$")
@@ -105,6 +115,7 @@ class TraceWriter:
         known_secrets: Sequence[str] = (),
         run_id: str | None = None,
         timestamp_factory: Callable[[], datetime] | None = None,
+        artifact_runner: CommandRunner | None = None,
     ) -> None:
         root = Path(workspace).resolve(strict=True)
         if not root.is_dir():
@@ -134,10 +145,15 @@ class TraceWriter:
         self.run_dir = run_dir
         self.events_path = events_path
         self.relative_events_path = events_path.relative_to(root).as_posix()
+        self.result_path = run_dir / "result.json"
+        self.relative_result_path = self.result_path.relative_to(root).as_posix()
+        self.patch_path = run_dir / "patch.diff"
+        self.relative_patch_path = self.patch_path.relative_to(root).as_posix()
         self._redactor = Redactor(known_secrets)
         self._timestamp_factory = timestamp_factory or (
             lambda: datetime.now(timezone.utc)
         )
+        self._artifact_runner = artifact_runner
         self._stream: TextIO | None = stream
         self._seq = 0
 
@@ -211,6 +227,166 @@ class TraceWriter:
                 stream.close()
             except OSError as exc:
                 raise TraceError("trace writer cannot be closed") from exc
+
+    def write_artifacts(self, result: AgentResult) -> AgentResult:
+        """Persist the host result and an optional redacted working-tree diff."""
+
+        self._assert_run_directory_safe()
+        patch_available, patch_metadata = self._write_patch_if_available()
+        completed = replace(
+            result,
+            run_id=self.run_id,
+            trace_path=self.relative_events_path,
+            result_path=self.relative_result_path,
+            patch_path=(self.relative_patch_path if patch_available else None),
+        )
+        payload = _result_payload(
+            completed,
+            patch_metadata=patch_metadata,
+            redactor=self._redactor,
+        )
+        encoded: bytes | None = None
+        try:
+            redacted_payload = _bounded_value(self._redactor.value(payload))
+            encoded = (
+                json.dumps(
+                    redacted_payload,
+                    ensure_ascii=True,
+                    allow_nan=False,
+                    sort_keys=True,
+                    indent=2,
+                )
+                + "\n"
+            ).encode("utf-8")
+            _atomic_write_new(self.run_dir, self.result_path, encoded)
+        except KeyboardInterrupt:
+            if encoded is not None and _installed_artifact_matches(
+                self.result_path,
+                encoded,
+            ):
+                return completed
+            return replace(completed, result_path=None)
+        except (TypeError, ValueError, UnicodeEncodeError, TraceError):
+            return replace(completed, result_path=None)
+        return completed
+
+    def _write_patch_if_available(self) -> tuple[bool, dict[str, Any]]:
+        runner = self._artifact_runner
+        if runner is None:
+            guard = _artifact_workspace_guard(self.workspace_root)
+            runner = CommandRunner(guard, CommandPolicy())
+        try:
+            repository = runner.run(
+                ["git", "rev-parse", "--is-inside-work-tree"],
+                cwd=".",
+                timeout_seconds=PATCH_GIT_TIMEOUT_SECONDS,
+            )
+        except ToolExecutionError as exc:
+            if exc.kind is ErrorKind.COMMAND_NONZERO_EXIT:
+                return False, _patch_metadata("not_git")
+            return False, {
+                "available": False,
+                "status": "git_unavailable",
+                "truncated": False,
+                "error_kind": exc.kind.value,
+            }
+        if str(repository.get("stdout", "")).strip().casefold() != "true":
+            return False, _patch_metadata("not_git")
+
+        try:
+            diff = runner.run(
+                [
+                    "git",
+                    "diff",
+                    "--no-color",
+                    "--no-ext-diff",
+                    "--no-textconv",
+                    "--",
+                    ".",
+                ],
+                cwd=".",
+                timeout_seconds=PATCH_GIT_TIMEOUT_SECONDS,
+            )
+        except ToolExecutionError as exc:
+            return False, {
+                "available": False,
+                "status": "git_diff_failed",
+                "truncated": False,
+                "error_kind": exc.kind.value,
+            }
+        total_bytes = diff.get("stdout_total_bytes")
+        if (
+            diff.get("stdout_truncated") is True
+            or (
+                isinstance(total_bytes, int)
+                and not isinstance(total_bytes, bool)
+                and total_bytes > PATCH_DIFF_LIMIT_BYTES
+            )
+        ):
+            return False, {
+                "available": False,
+                "status": "git_diff_truncated",
+                "truncated": True,
+                "error_kind": None,
+                "limit_bytes": PATCH_DIFF_LIMIT_BYTES,
+            }
+        text = diff.get("stdout")
+        if not isinstance(text, str):
+            return False, {
+                "available": False,
+                "status": "git_diff_invalid_output",
+                "truncated": False,
+                "error_kind": None,
+            }
+        if not text:
+            return False, _patch_metadata("no_changes")
+        raw_patch = text.encode("utf-8", errors="replace")
+        if len(raw_patch) > PATCH_DIFF_LIMIT_BYTES:
+            return False, {
+                "available": False,
+                "status": "git_diff_truncated",
+                "truncated": True,
+                "error_kind": None,
+                "limit_bytes": PATCH_DIFF_LIMIT_BYTES,
+            }
+        redacted = self._redactor.text(text)
+        redacted_patch = redacted.encode("utf-8", errors="replace")
+        if len(redacted_patch) > PATCH_DIFF_LIMIT_BYTES:
+            return False, {
+                "available": False,
+                "status": "git_diff_truncated",
+                "truncated": True,
+                "error_kind": None,
+                "limit_bytes": PATCH_DIFF_LIMIT_BYTES,
+            }
+        try:
+            _atomic_write_new(
+                self.run_dir,
+                self.patch_path,
+                redacted_patch,
+            )
+        except TraceError:
+            return False, _patch_metadata("patch_write_failed")
+        except KeyboardInterrupt:
+            if not _installed_artifact_matches(self.patch_path, redacted_patch):
+                return False, _patch_metadata("patch_write_interrupted")
+        return True, {
+            "available": True,
+            "status": "written",
+            "redacted": redacted != text,
+            "truncated": False,
+            "error_kind": None,
+        }
+
+    def _assert_run_directory_safe(self) -> None:
+        try:
+            resolved = self.run_dir.resolve(strict=True)
+        except OSError as exc:
+            raise TraceError("trace run directory is unavailable") from exc
+        if is_link_like(self.run_dir) or not resolved.is_relative_to(
+            self.workspace_root
+        ):
+            raise TraceError("trace run directory is no longer safe")
 
     def __enter__(self) -> TraceWriter:
         return self
@@ -323,6 +499,86 @@ def history_summary(messages: Sequence[Message]) -> dict[str, Any]:
     }
 
 
+def _result_payload(
+    result: AgentResult,
+    *,
+    patch_metadata: Mapping[str, Any],
+    redactor: Redactor,
+) -> dict[str, Any]:
+    final_verification = result.final_verification
+    final_message = redactor.text(result.final_message)
+    error_message = (
+        redactor.text(result.error.message) if result.error is not None else None
+    )
+    protected_unchanged = (
+        final_verification.protected_unchanged
+        if final_verification is not None
+        else None
+    )
+    protected_changes = (
+        [
+            {"path": change.relative_path, "kind": change.kind.value}
+            for change in final_verification.protected_changes
+        ]
+        if final_verification is not None
+        else []
+    )
+    return {
+        "schema_version": RESULT_SCHEMA_VERSION,
+        "run_id": result.run_id,
+        "state": result.state.value,
+        "final_message": final_message,
+        "final_message_length_chars": len(final_message),
+        "final_message_truncated": (
+            len(final_message) > TRACE_GENERIC_STRING_CHARS
+        ),
+        "step_count": result.step_count,
+        "tool_call_count": result.tool_call_count,
+        "mutation_seq": result.mutation_seq,
+        "verified_seq": result.verified_seq,
+        "repair_rounds_used": result.repair_rounds_used,
+        "baseline": (
+            verification_result_payload(result.baseline_verification)
+            if result.baseline_verification is not None
+            else None
+        ),
+        "final_verification": (
+            verification_result_payload(final_verification)
+            if final_verification is not None
+            else None
+        ),
+        "protected_unchanged": protected_unchanged,
+        "protected_changes": protected_changes,
+        "changed_files": list(result.changed_files),
+        "changed_files_truncated": (
+            len(result.changed_files) > TRACE_MAX_COLLECTION_ITEMS
+        ),
+        "trace_path": result.trace_path,
+        "result_path": result.result_path,
+        "patch_path": result.patch_path,
+        "patch": dict(patch_metadata),
+        "duration_ms": result.duration_ms,
+        "model_usage": dict(result.model_usage),
+        "error_kind": (
+            result.error.kind.value if result.error is not None else None
+        ),
+        "error_message": error_message,
+        "error_message_truncated": (
+            error_message is not None
+            and len(error_message) > TRACE_GENERIC_STRING_CHARS
+        ),
+    }
+
+
+def _patch_metadata(status: str) -> dict[str, Any]:
+    return {
+        "available": False,
+        "status": status,
+        "truncated": False,
+        "error_kind": None,
+    }
+
+
 def _safe_directory(root: Path, path: Path) -> Path:
     try:
         if path.exists():
@@ -338,6 +594,61 @@ def _safe_directory(root: Path, path: Path) -> Path:
     if not resolved.is_relative_to(root):
         raise TraceError("trace metadata directory escapes the workspace")
     return resolved
+
+
+def _artifact_workspace_guard(root: Path) -> WorkspaceGuard:
+    try:
+        return WorkspaceGuard(root)
+    except (OSError, ValueError) as exc:
+        raise TraceError("artifact workspace cannot be prepared") from exc
+
+
+def _atomic_write_new(directory: Path, target: Path, content: bytes) -> None:
+    if target.exists() or is_link_like(target):
+        raise TraceError(f"artifact already exists: {target.name}")
+    temp_path: Path | None = None
+    try:
+        descriptor, temp_name = tempfile.mkstemp(
+            dir=directory,
+            prefix=f".{target.name}.",
+            suffix=".tmp",
+        )
+        temp_path = Path(temp_name)
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if target.exists() or is_link_like(target):
+            raise TraceError(f"artifact already exists: {target.name}")
+        try:
+            if os.name == "nt":
+                os.rename(temp_path, target)
+                temp_path = None
+            else:
+                os.link(temp_path, target)
+        except FileExistsError as exc:
+            raise TraceError(f"artifact already exists: {target.name}") from exc
+    except TraceError:
+        raise
+    except OSError as exc:
+        raise TraceError(f"artifact cannot be written: {target.name}") from exc
+    finally:
+        if temp_path is not None:
+            try:
+                temp_path.unlink(missing_ok=True)
+            except OSError:
+                pass
+
+
+def _installed_artifact_matches(path: Path, expected: bytes) -> bool:
+    try:
+        return (
+            not is_link_like(path)
+            and path.is_file()
+            and path.read_bytes() == expected
+        )
+    except OSError:
+        return False
 
 
 def _timestamp_text(value: datetime) -> str:

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import time
 
 from .context import ContextPolicy
 from .model import ModelClient, ModelClientError, ModelProtocolError
@@ -72,6 +73,7 @@ class AgentLoop:
         self._trace_writer = trace_writer
 
     def run(self, task: str) -> AgentResult:
+        started_at = time.monotonic()
         state = AgentState.INITIALIZING
         state_history = [state]
         history = [
@@ -87,6 +89,8 @@ class AgentLoop:
         repair_rounds_used = 0
         last_failure_signature = None
         same_failure_count = 0
+        changed_files: set[str] = set()
+        model_usage: dict[str, int] = {}
         trace_available = self._trace_writer is not None
 
         def trace(event_type: str, payload: dict[str, object] | None = None) -> None:
@@ -121,6 +125,7 @@ class AgentLoop:
             *,
             error: AgentError | None = None,
         ) -> AgentResult:
+            duration_ms = max(0, round((time.monotonic() - started_at) * 1000))
             result = AgentResult(
                 state=state,
                 final_message=final_message,
@@ -143,6 +148,9 @@ class AgentLoop:
                     if self._trace_writer is not None
                     else None
                 ),
+                changed_files=tuple(sorted(changed_files)),
+                duration_ms=duration_ms,
+                model_usage=dict(sorted(model_usage.items())),
                 state_history=tuple(state_history),
             )
             if self._trace_writer is not None:
@@ -153,6 +161,9 @@ class AgentLoop:
                     "mutation_seq": mutation_seq,
                     "verified_seq": verified_seq,
                     "repair_rounds_used": repair_rounds_used,
+                    "changed_files": list(result.changed_files),
+                    "duration_ms": duration_ms,
+                    "model_usage": result.model_usage,
                     "error_kind": error.kind.value if error is not None else None,
                     "error_message": error.message if error is not None else None,
                 }
@@ -170,6 +181,10 @@ class AgentLoop:
                 try:
                     self._trace_writer.close()
                 except TraceError:
+                    pass
+                try:
+                    result = self._trace_writer.write_artifacts(result)
+                except (TraceError, KeyboardInterrupt):
                     pass
             return result
 
@@ -294,6 +309,9 @@ class AgentLoop:
                     visible_history,
                     self._tools.schemas(),
                 )
+                for key, value in response.usage.items():
+                    if isinstance(value, int) and not isinstance(value, bool):
+                        model_usage[key] = model_usage.get(key, 0) + value
                 call_ids = tuple(call.id for call in response.tool_calls)
                 if len(set(call_ids)) != len(call_ids):
                     raise ModelProtocolError(
@@ -657,6 +675,9 @@ class AgentLoop:
                     )
                 tool_call_count += 1
                 trace("tool_execution_finished", tool_result_payload(result))
+                changed_path = _successful_file_change(call, result)
+                if changed_path is not None:
+                    changed_files.add(changed_path)
                 if result.invalidates_verification:
                     previous_mutation_seq = mutation_seq
                     mutation_seq += 1
@@ -679,6 +700,23 @@ def _tool_message(result: ToolResult) -> Message:
         content=result.content,
         tool_result=result,
     )
+
+
+def _successful_file_change(call: ToolCall, result: ToolResult) -> str | None:
+    if (
+        not result.ok
+        or not result.invalidates_verification
+        or call.name not in {"edit_file", "write_file"}
+    ):
+        return None
+    try:
+        payload = json.loads(result.content)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(payload, dict):
+        return None
+    path = payload.get("path")
+    return path if isinstance(path, str) and path else None
 
 
 def _unverified_completion_result(
