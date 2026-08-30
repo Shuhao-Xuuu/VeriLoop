@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 from dataclasses import FrozenInstanceError
+import hashlib
+import json
 from pathlib import Path
 
 import pytest
@@ -18,15 +20,19 @@ from veriloop.protocol import (
     VerificationCommandResult,
     VerificationPhase,
     VerificationResult,
+    ToolCall,
 )
 from veriloop.filesystem import WorkspaceGuard
 from veriloop.process import CommandPolicy, CommandRunner
-from veriloop.tools import ToolRegistry
+from veriloop.tools import ToolRegistry, register_filesystem_tools
 from veriloop.verification import (
     BaselinePolicy,
     VerificationConfigError,
     VerificationGate,
+    build_protected_manifest,
+    compare_protected_manifests,
     load_verification_spec,
+    protected_guard_for_spec,
 )
 
 
@@ -55,6 +61,21 @@ def final_response(text: str = "done") -> ModelResponse:
         tool_calls=(),
         finish_reason=FinishReason.STOP,
     )
+
+
+def loaded_components(workspace: Path):
+    guard = WorkspaceGuard(workspace)
+    runner = CommandRunner(guard, CommandPolicy())
+    spec = load_verification_spec(guard, runner)
+    return guard, runner, spec
+
+
+def execute_file_tool(
+    registry: ToolRegistry,
+    name: str,
+    arguments: dict[str, object],
+):
+    return registry.execute(ToolCall(id=f"{name}-call", name=name, arguments=arguments))
 
 
 def test_verification_protocol_exposes_explicit_terminal_states_and_errors() -> None:
@@ -451,3 +472,242 @@ argv = ["python", "second.py"]
         2,
         0,
     ]
+
+
+def test_protected_manifest_detects_modified_deleted_and_created_files(
+    tmp_path: Path,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    changed = tests_dir / "changed.py"
+    deleted = tests_dir / "deleted.py"
+    changed.write_text("value = 1\n", encoding="utf-8")
+    deleted.write_text("present = True\n", encoding="utf-8")
+    write_config(
+        tmp_path,
+        "[verification]\nprotected_globs = [\"tests/**\"]\n",
+    )
+    guard, _, spec = loaded_components(tmp_path)
+    initial = build_protected_manifest(guard, spec)
+
+    changed.write_text("value = 2\n", encoding="utf-8")
+    deleted.unlink()
+    (tests_dir / "created.py").write_text("new = True\n", encoding="utf-8")
+    current = build_protected_manifest(guard, spec)
+
+    assert [
+        (change.relative_path, change.kind)
+        for change in compare_protected_manifests(initial, current)
+    ] == [
+        ("tests/changed.py", ProtectedChangeKind.MODIFIED),
+        ("tests/created.py", ProtectedChangeKind.CREATED),
+        ("tests/deleted.py", ProtectedChangeKind.DELETED),
+    ]
+
+
+def test_protected_manifest_supports_multiple_globs_and_ignores_caches(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "tests").mkdir()
+    (tmp_path / "docs").mkdir()
+    (tmp_path / "tests" / "test_value.py").write_text("test = 1\n", encoding="utf-8")
+    (tmp_path / "docs" / "contract.md").write_text("contract\n", encoding="utf-8")
+    write_config(
+        tmp_path,
+        "[verification]\nprotected_globs = [\"**\", \"tests/**\", \"docs/*.md\"]\n",
+    )
+    guard, _, spec = loaded_components(tmp_path)
+    initial = build_protected_manifest(guard, spec)
+
+    cache = tmp_path / "tests" / "__pycache__"
+    cache.mkdir()
+    (cache / "test_value.pyc").write_bytes(b"generated")
+    run_dir = tmp_path / ".veriloop" / "runs" / "one"
+    run_dir.mkdir(parents=True)
+    (run_dir / "events.jsonl").write_text("{}\n", encoding="utf-8")
+    current = build_protected_manifest(guard, spec)
+
+    paths = [record.relative_path for record in initial]
+    assert paths == [".veriloop.toml", "docs/contract.md", "tests/test_value.py"]
+    assert compare_protected_manifests(initial, current) == ()
+
+
+def test_config_is_manifested_even_when_it_does_not_match_a_glob(
+    tmp_path: Path,
+) -> None:
+    write_config(tmp_path, "[verification]\nprotected_globs = []\n")
+    guard, runner, spec = loaded_components(tmp_path)
+    verification_gate = VerificationGate(spec, runner)
+
+    write_config(tmp_path, "[verification]\nmax_repair_rounds = 9\n")
+
+    changes = verification_gate.protected_changes()
+    assert len(verification_gate.protected_manifest) == 1
+    assert [(item.relative_path, item.kind) for item in changes] == [
+        (".veriloop.toml", ProtectedChangeKind.MODIFIED)
+    ]
+    assert guard.root == tmp_path.resolve()
+
+
+def test_missing_config_creation_is_detected_from_frozen_spec(tmp_path: Path) -> None:
+    guard, _, spec = loaded_components(tmp_path)
+    initial = build_protected_manifest(guard, spec)
+
+    write_config(tmp_path, "[verification]\n")
+    current = build_protected_manifest(guard, spec)
+
+    assert initial[0].relative_path == ".veriloop.toml"
+    assert initial[0].existed is False
+    assert compare_protected_manifests(initial, current) == (
+        ProtectedFileChange(".veriloop.toml", ProtectedChangeKind.CREATED),
+    )
+
+
+def test_protected_file_type_replacement_is_detected(tmp_path: Path) -> None:
+    config = write_config(tmp_path, "[verification]\n")
+    guard, _, spec = loaded_components(tmp_path)
+    initial = build_protected_manifest(guard, spec)
+
+    config.unlink()
+    config.mkdir()
+    current = build_protected_manifest(guard, spec)
+
+    assert compare_protected_manifests(initial, current) == (
+        ProtectedFileChange(".veriloop.toml", ProtectedChangeKind.REPLACED),
+    )
+
+
+def test_manifest_change_evidence_contains_paths_not_protected_contents(
+    tmp_path: Path,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    protected = tests_dir / "secret_case.py"
+    protected.write_text("fictional-sensitive-content\n", encoding="utf-8")
+    write_config(
+        tmp_path,
+        "[verification]\nprotected_globs = [\"tests/**\"]\n",
+    )
+    guard, _, spec = loaded_components(tmp_path)
+    initial = build_protected_manifest(guard, spec)
+
+    protected.write_text("different-fictional-content\n", encoding="utf-8")
+    changes = compare_protected_manifests(
+        initial,
+        build_protected_manifest(guard, spec),
+    )
+
+    assert changes[0].relative_path == "tests/secret_case.py"
+    assert "fictional-sensitive-content" not in repr(changes)
+
+
+def test_file_tools_deny_edit_create_and_overwrite_for_protected_globs(
+    tmp_path: Path,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    target = tests_dir / "test_value.py"
+    original = b"value = 1\n"
+    target.write_bytes(original)
+    write_config(
+        tmp_path,
+        "[verification]\nprotected_globs = [\"tests/**\"]\n",
+    )
+    base_guard, _, spec = loaded_components(tmp_path)
+    guarded = protected_guard_for_spec(base_guard, spec)
+    registry = ToolRegistry()
+    register_filesystem_tools(registry, guarded)
+
+    edit = execute_file_tool(
+        registry,
+        "edit_file",
+        {
+            "path": "tests/test_value.py",
+            "old_text": "value = 1",
+            "new_text": "value = 2",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    overwrite = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "tests/test_value.py",
+            "content": "value = 2\n",
+            "mode": "overwrite",
+            "expected_sha256": hashlib.sha256(original).hexdigest(),
+        },
+    )
+    create = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "tests/new_test.py",
+            "content": "new = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert [edit.error_kind, overwrite.error_kind, create.error_kind] == [
+        ErrorKind.PATH_WRITE_DENIED,
+        ErrorKind.PATH_WRITE_DENIED,
+        ErrorKind.PATH_WRITE_DENIED,
+    ]
+    assert target.read_bytes() == original
+    assert not (tests_dir / "new_test.py").exists()
+    assert "fictional-sensitive-content" not in json.dumps(
+        [edit.content, overwrite.content, create.content]
+    )
+
+
+def test_missing_config_path_is_also_denied_to_file_tools(tmp_path: Path) -> None:
+    base_guard, _, spec = loaded_components(tmp_path)
+    registry = ToolRegistry()
+    register_filesystem_tools(registry, protected_guard_for_spec(base_guard, spec))
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": ".veriloop.toml",
+            "content": "[verification]\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / ".veriloop.toml").exists()
+
+
+def test_existing_config_is_denied_to_edit_and_overwrite_tools(tmp_path: Path) -> None:
+    original = b"[verification]\nbaseline_policy = \"skip\"\n"
+    (tmp_path / ".veriloop.toml").write_bytes(original)
+    base_guard, _, spec = loaded_components(tmp_path)
+    registry = ToolRegistry()
+    register_filesystem_tools(registry, protected_guard_for_spec(base_guard, spec))
+    digest = hashlib.sha256(original).hexdigest()
+
+    edit = execute_file_tool(
+        registry,
+        "edit_file",
+        {
+            "path": ".veriloop.toml",
+            "old_text": "skip",
+            "new_text": "record_only",
+            "expected_sha256": digest,
+        },
+    )
+    overwrite = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": ".veriloop.toml",
+            "content": "[verification]\n",
+            "mode": "overwrite",
+            "expected_sha256": digest,
+        },
+    )
+
+    assert edit.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert overwrite.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert (tmp_path / ".veriloop.toml").read_bytes() == original

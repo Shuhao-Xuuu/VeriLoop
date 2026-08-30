@@ -4,14 +4,26 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from pathlib import Path, PureWindowsPath
+import hashlib
+import os
+from pathlib import Path
+import stat
 import tomllib
 from typing import Any
 
-from .filesystem import WorkspaceGuard
+from .filesystem import (
+    SKIPPED_DIRECTORIES,
+    WorkspaceGuard,
+    is_link_like,
+    matches_workspace_glob,
+    normalize_workspace_glob,
+)
 from .process import CommandRunner
 from .protocol import (
     ErrorKind,
+    ProtectedChangeKind,
+    ProtectedFileChange,
+    ProtectedFileRecord,
     VerificationCommandResult,
     VerificationPhase,
     VerificationResult,
@@ -53,12 +65,25 @@ class VerificationConfigError(ValueError):
     kind = ErrorKind.INVALID_VERIFICATION_CONFIG
 
 
+class ProtectedManifestError(RuntimeError):
+    """Protected inputs could not be recorded without ambiguity."""
+
+
 class VerificationGate:
     """Run frozen verification commands without owning the agent loop."""
 
     def __init__(self, spec: VerificationSpec, runner: CommandRunner) -> None:
         self.spec = spec
         self._runner = runner
+        self._initial_manifest = build_protected_manifest(runner.guard, spec)
+
+    @property
+    def protected_manifest(self) -> tuple[ProtectedFileRecord, ...]:
+        return self._initial_manifest
+
+    def protected_changes(self) -> tuple[ProtectedFileChange, ...]:
+        current = build_protected_manifest(self._runner.guard, self.spec)
+        return compare_protected_manifests(self._initial_manifest, current)
 
     def run_baseline(self, *, mutation_seq: int = 0) -> VerificationResult:
         if not self.spec.commands or self.spec.baseline_policy is BaselinePolicy.SKIP:
@@ -204,6 +229,74 @@ def load_verification_spec(
     )
 
 
+def build_protected_manifest(
+    guard: WorkspaceGuard,
+    spec: VerificationSpec,
+) -> tuple[ProtectedFileRecord, ...]:
+    """Hash the frozen protected path set without following links."""
+
+    records: dict[str, ProtectedFileRecord] = {}
+    for path in _workspace_entries(guard.root):
+        relative = path.relative_to(guard.root).as_posix()
+        if any(
+            matches_workspace_glob(relative, pattern)
+            for pattern in spec.protected_globs
+        ):
+            records[relative] = _protected_record(path, relative)
+
+    if spec.config_path is not None:
+        config_path = guard.lexical_path(spec.config_path)
+        records[spec.config_path] = _protected_record(
+            config_path,
+            spec.config_path,
+        )
+
+    return tuple(records[path] for path in sorted(records))
+
+
+def compare_protected_manifests(
+    initial: tuple[ProtectedFileRecord, ...],
+    current: tuple[ProtectedFileRecord, ...],
+) -> tuple[ProtectedFileChange, ...]:
+    """Return stable path-only integrity changes between two manifests."""
+
+    before = {record.relative_path: record for record in initial}
+    after = {record.relative_path: record for record in current}
+    changes: list[ProtectedFileChange] = []
+    for relative in sorted(set(before) | set(after)):
+        old = before.get(relative)
+        new = after.get(relative)
+        if (old is None or not old.existed) and new is not None and new.existed:
+            kind = ProtectedChangeKind.CREATED
+        elif old is not None and old.existed and (new is None or not new.existed):
+            kind = ProtectedChangeKind.DELETED
+        elif old is None or new is None or not old.existed or not new.existed:
+            continue
+        elif old.file_kind != new.file_kind:
+            kind = ProtectedChangeKind.REPLACED
+        elif old.size != new.size or old.sha256 != new.sha256:
+            kind = ProtectedChangeKind.MODIFIED
+        else:
+            continue
+        changes.append(ProtectedFileChange(relative_path=relative, kind=kind))
+    return tuple(changes)
+
+
+def protected_guard_for_spec(
+    guard: WorkspaceGuard,
+    spec: VerificationSpec,
+) -> WorkspaceGuard:
+    """Create the model-facing guard with frozen verification write denies."""
+
+    exact_paths = (spec.config_path,) if spec.config_path is not None else ()
+    return WorkspaceGuard(
+        guard.root,
+        max_file_bytes=guard.max_file_bytes,
+        protected_write_globs=spec.protected_globs,
+        protected_write_paths=exact_paths,
+    )
+
+
 def _empty_spec(config_path: str | None) -> VerificationSpec:
     return VerificationSpec(
         baseline_policy=BaselinePolicy.RECORD_ONLY,
@@ -258,18 +351,13 @@ def _protected_globs(value: Any) -> tuple[str, ...]:
         raise VerificationConfigError("protected_globs must be a list of strings")
     normalized: list[str] = []
     for pattern in value:
-        if (
-            not pattern
-            or "\x00" in pattern
-            or "\\" in pattern
-            or pattern.startswith("/")
-            or PureWindowsPath(pattern).drive
-            or any(part in {"", ".", ".."} for part in pattern.split("/"))
-        ):
+        try:
+            normalized_pattern = normalize_workspace_glob(pattern)
+        except ValueError as exc:
             raise VerificationConfigError(
                 f"protected glob must be a non-empty workspace-relative pattern: {pattern}"
-            )
-        normalized.append(pattern)
+            ) from exc
+        normalized.append(normalized_pattern)
     return tuple(normalized)
 
 
@@ -339,6 +427,90 @@ def _commands(
             )
         )
     return tuple(commands)
+
+
+def _workspace_entries(root: Path) -> tuple[Path, ...]:
+    entries: list[Path] = []
+    pending = [root]
+    try:
+        while pending:
+            directory = pending.pop()
+            children = sorted(os.scandir(directory), key=lambda item: item.name)
+            for child in children:
+                path = Path(child.path)
+                link_like = is_link_like(path)
+                if child.name.casefold() in SKIPPED_DIRECTORIES and (
+                    link_like or child.is_dir(follow_symlinks=False)
+                ):
+                    continue
+                if child.is_dir(follow_symlinks=False) and not link_like:
+                    pending.append(path)
+                else:
+                    entries.append(path)
+    except OSError as exc:
+        raise ProtectedManifestError(
+            f"protected paths cannot be enumerated: {type(exc).__name__}"
+        ) from exc
+    return tuple(sorted(entries, key=lambda path: path.relative_to(root).as_posix()))
+
+
+def _protected_record(path: Path, relative: str) -> ProtectedFileRecord:
+    try:
+        details = path.lstat()
+    except FileNotFoundError:
+        return ProtectedFileRecord(
+            relative_path=relative,
+            existed=False,
+            size=None,
+            sha256=None,
+            file_kind="missing",
+        )
+    except OSError as exc:
+        raise ProtectedManifestError(
+            f"protected path metadata cannot be read: {relative}"
+        ) from exc
+
+    mode = details.st_mode
+    if is_link_like(path):
+        try:
+            link_value = os.readlink(path).encode("utf-8", errors="surrogatepass")
+        except OSError:
+            link_value = f"reparse:{details.st_size}".encode("ascii")
+        return ProtectedFileRecord(
+            relative_path=relative,
+            existed=True,
+            size=details.st_size,
+            sha256=hashlib.sha256(link_value).hexdigest(),
+            file_kind="link",
+        )
+    if stat.S_ISREG(mode):
+        digest = hashlib.sha256()
+        try:
+            with path.open("rb") as stream:
+                for block in iter(lambda: stream.read(128 * 1024), b""):
+                    digest.update(block)
+        except OSError as exc:
+            raise ProtectedManifestError(
+                f"protected file cannot be hashed: {relative}"
+            ) from exc
+        return ProtectedFileRecord(
+            relative_path=relative,
+            existed=True,
+            size=details.st_size,
+            sha256=digest.hexdigest(),
+            file_kind="file",
+        )
+    if stat.S_ISDIR(mode):
+        file_kind = "directory"
+    else:
+        file_kind = "other"
+    return ProtectedFileRecord(
+        relative_path=relative,
+        existed=True,
+        size=details.st_size,
+        sha256=None,
+        file_kind=file_kind,
+    )
 
 
 def _run_verification_command(

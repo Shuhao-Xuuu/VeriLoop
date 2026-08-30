@@ -131,6 +131,7 @@ class ProtectedFileRecord:
     existed: bool
     size: int | None
     sha256: str | None
+    file_kind: str = "file"
 
 
 @dataclass(frozen=True, slots=True)

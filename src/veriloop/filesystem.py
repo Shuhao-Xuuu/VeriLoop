@@ -11,7 +11,7 @@ import os
 from pathlib import Path, PureWindowsPath
 import stat
 import tempfile
-from typing import Any, Iterator
+from typing import Any, Iterable, Iterator
 
 from .protocol import ErrorKind
 from .tools import ToolExecutionError
@@ -68,6 +68,8 @@ class WorkspaceGuard:
         root: str | Path,
         *,
         max_file_bytes: int = DEFAULT_MAX_FILE_BYTES,
+        protected_write_globs: Iterable[str] = (),
+        protected_write_paths: Iterable[str] = (),
     ) -> None:
         root_path = Path(root)
         if not root_path.exists():
@@ -78,6 +80,19 @@ class WorkspaceGuard:
             raise ValueError("max_file_bytes must be positive")
         self._root = root_path.resolve(strict=True)
         self._max_file_bytes = max_file_bytes
+        self._protected_write_globs = tuple(
+            normalize_workspace_glob(pattern) for pattern in protected_write_globs
+        )
+        protected_paths: set[str] = set()
+        for model_path in protected_write_paths:
+            if not isinstance(model_path, str) or not model_path:
+                raise ValueError("protected write paths must be non-empty strings")
+            try:
+                resolved = self._resolve(model_path, allow_root=False)
+            except ToolExecutionError as exc:
+                raise ValueError(f"invalid protected write path: {model_path}") from exc
+            protected_paths.add(resolved.relative.as_posix())
+        self._protected_write_paths = frozenset(protected_paths)
 
     @property
     def root(self) -> Path:
@@ -86,6 +101,14 @@ class WorkspaceGuard:
     @property
     def max_file_bytes(self) -> int:
         return self._max_file_bytes
+
+    @property
+    def protected_write_globs(self) -> tuple[str, ...]:
+        return self._protected_write_globs
+
+    @property
+    def protected_write_paths(self) -> frozenset[str]:
+        return self._protected_write_paths
 
     def resolve(
         self,
@@ -144,6 +167,11 @@ class WorkspaceGuard:
             raise ToolExecutionError(
                 ErrorKind.PATH_WRITE_DENIED,
                 f"writing protected path is denied: {model_path}",
+            )
+        if self._is_protected_write(model_path, resolved):
+            raise ToolExecutionError(
+                ErrorKind.PATH_WRITE_DENIED,
+                f"writing verification-protected path is denied: {model_path}",
             )
         return resolved.resolved
 
@@ -286,6 +314,23 @@ class WorkspaceGuard:
         except ValueError:
             return False
         return self._is_sensitive(relative)
+
+    def _is_protected_write(
+        self,
+        model_path: str,
+        resolved: _ResolvedPath,
+    ) -> bool:
+        lexical = Path(model_path).as_posix()
+        canonical = resolved.relative.as_posix()
+        for candidate in (lexical, canonical):
+            if candidate in self._protected_write_paths:
+                return True
+            if any(
+                matches_workspace_glob(candidate, pattern)
+                for pattern in self._protected_write_globs
+            ):
+                return True
+        return False
 
 
 def list_files(
@@ -908,6 +953,38 @@ def _bounded_text(text: str, limit: int) -> str:
     omitted = len(text) - head - tail
     marker = f"\n... <{omitted} characters omitted> ...\n"
     return text[:head] + marker + text[-tail:]
+
+
+def normalize_workspace_glob(pattern: str) -> str:
+    """Validate one deterministic POSIX-style workspace-relative glob."""
+
+    if (
+        not isinstance(pattern, str)
+        or not pattern
+        or "\x00" in pattern
+        or "\\" in pattern
+        or pattern.startswith("/")
+        or PureWindowsPath(pattern).drive
+        or any(part in {"", ".", ".."} for part in pattern.split("/"))
+    ):
+        raise ValueError(
+            "workspace glob must be a non-empty POSIX-style relative pattern"
+        )
+    return pattern
+
+
+def matches_workspace_glob(relative_path: str, pattern: str) -> bool:
+    """Match a normalized workspace path without platform case folding."""
+
+    normalized_pattern = normalize_workspace_glob(pattern)
+    normalized_path = relative_path.replace("\\", "/")
+    return fnmatchcase(normalized_path, normalized_pattern)
+
+
+def is_link_like(path: Path) -> bool:
+    """Return whether a path is a symlink or Windows reparse point."""
+
+    return _is_link_like(path)
 
 
 def _is_link_like(path: Path) -> bool:
