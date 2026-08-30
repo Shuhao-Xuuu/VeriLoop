@@ -59,6 +59,7 @@ class OpenAICompatibleModel:
         client: Any | None = None,
         sleep: Callable[[float], None] = time.sleep,
         backoff_seconds: float = 0.25,
+        retry_observer: Callable[[int, str, float], None] | None = None,
     ) -> None:
         if client is None:
             client = openai.OpenAI(
@@ -70,6 +71,7 @@ class OpenAICompatibleModel:
         self._model = model
         self._sleep = sleep
         self._backoff_seconds = backoff_seconds
+        self._retry_observer = retry_observer
 
     def complete(
         self,
@@ -94,12 +96,24 @@ class OpenAICompatibleModel:
             except Exception as exc:
                 if not _is_retryable_provider_error(exc):
                     raise ProviderFatalError(_describe_provider_error(exc)) from exc
+                description = _describe_provider_error(exc)
                 if attempt == 2:
                     raise ProviderRetryExhaustedError(
                         f"provider retry exhausted after 3 requests: "
-                        f"{_describe_provider_error(exc)}"
+                        f"{description}"
                     ) from exc
-                self._sleep(self._backoff_seconds * (2**attempt))
+                delay_seconds = self._backoff_seconds * (2**attempt)
+                if self._retry_observer is not None:
+                    try:
+                        self._retry_observer(
+                            attempt + 1,
+                            type(exc).__name__,
+                            delay_seconds,
+                        )
+                    except Exception:
+                        # Observability must not replace the provider outcome.
+                        pass
+                self._sleep(delay_seconds)
                 continue
 
             return _parse_provider_response(response)

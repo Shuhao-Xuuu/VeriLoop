@@ -22,6 +22,15 @@ from .tools import (
     ToolRegistry,
     make_tool_failure,
 )
+from .trace import (
+    TraceError,
+    TraceWriter,
+    history_summary,
+    model_response_payload,
+    tool_call_payload,
+    tool_result_payload,
+    verification_result_payload,
+)
 from .verification import VerificationGate
 
 
@@ -50,6 +59,7 @@ class AgentLoop:
         system_prompt: str = DEFAULT_SYSTEM_PROMPT,
         verification_gate: VerificationGate | None = None,
         context_policy: ContextPolicy | None = None,
+        trace_writer: TraceWriter | None = None,
     ) -> None:
         if max_steps < 0:
             raise ValueError("max_steps must be non-negative")
@@ -59,6 +69,7 @@ class AgentLoop:
         self._system_prompt = system_prompt
         self._verification_gate = verification_gate
         self._context_policy = context_policy or ContextPolicy()
+        self._trace_writer = trace_writer
 
     def run(self, task: str) -> AgentResult:
         state = AgentState.INITIALIZING
@@ -76,19 +87,41 @@ class AgentLoop:
         repair_rounds_used = 0
         last_failure_signature = None
         same_failure_count = 0
+        trace_available = self._trace_writer is not None
+
+        def trace(event_type: str, payload: dict[str, object] | None = None) -> None:
+            nonlocal trace_available
+            if self._trace_writer is None or not trace_available:
+                return
+            try:
+                self._trace_writer.emit(event_type, state, payload)
+            except TraceError:
+                trace_available = False
+                try:
+                    self._trace_writer.close()
+                except TraceError:
+                    pass
 
         def transition(next_state: AgentState) -> None:
             nonlocal state
+            previous_state = state
             state = next_state
             if state_history[-1] is not next_state:
                 state_history.append(next_state)
+                trace(
+                    "state_changed",
+                    {
+                        "from_state": previous_state.value,
+                        "to_state": next_state.value,
+                    },
+                )
 
         def finish(
             final_message: str,
             *,
             error: AgentError | None = None,
         ) -> AgentResult:
-            return AgentResult(
+            result = AgentResult(
                 state=state,
                 final_message=final_message,
                 step_count=step_count,
@@ -100,16 +133,70 @@ class AgentLoop:
                 baseline_verification=baseline_verification,
                 final_verification=final_verification,
                 repair_rounds_used=repair_rounds_used,
+                run_id=(
+                    self._trace_writer.run_id
+                    if self._trace_writer is not None
+                    else None
+                ),
+                trace_path=(
+                    self._trace_writer.relative_events_path
+                    if self._trace_writer is not None
+                    else None
+                ),
                 state_history=tuple(state_history),
             )
+            if self._trace_writer is not None:
+                terminal_payload = {
+                    "state": state.value,
+                    "step_count": step_count,
+                    "tool_call_count": tool_call_count,
+                    "mutation_seq": mutation_seq,
+                    "verified_seq": verified_seq,
+                    "repair_rounds_used": repair_rounds_used,
+                    "error_kind": error.kind.value if error is not None else None,
+                    "error_message": error.message if error is not None else None,
+                }
+                if state is AgentState.CANCELLED:
+                    trace("run_cancelled", terminal_payload)
+                elif error is not None:
+                    trace("run_failed", terminal_payload)
+                trace(
+                    "run_finished",
+                    {
+                        **terminal_payload,
+                        "final_message": final_message,
+                    },
+                )
+                try:
+                    self._trace_writer.close()
+                except TraceError:
+                    pass
+            return result
+
+        trace(
+            "run_started",
+            {
+                "task_length_chars": len(task),
+                "max_steps": self._max_steps,
+                "verification_configured": self._verification_gate is not None,
+            },
+        )
 
         if self._verification_gate is not None:
             transition(AgentState.BASELINE_VERIFYING)
+            trace(
+                "baseline_started",
+                {
+                    "policy": self._verification_gate.spec.baseline_policy.value,
+                    "command_count": len(self._verification_gate.spec.commands),
+                },
+            )
             try:
                 baseline_verification = self._verification_gate.run_baseline(
                     mutation_seq=mutation_seq
                 )
             except KeyboardInterrupt:
+                trace("baseline_finished", {"cancelled": True})
                 transition(AgentState.CANCELLED)
                 return finish(
                     "",
@@ -119,6 +206,13 @@ class AgentLoop:
                     ),
                 )
             except Exception as exc:
+                trace(
+                    "baseline_finished",
+                    {
+                        "error_kind": ErrorKind.INTERNAL_ERROR.value,
+                        "error_type": type(exc).__name__,
+                    },
+                )
                 transition(AgentState.FAILED)
                 return finish(
                     "",
@@ -130,6 +224,10 @@ class AgentLoop:
                         ),
                     ),
                 )
+            trace(
+                "baseline_finished",
+                verification_result_payload(baseline_verification),
+            )
             if not baseline_verification.passed:
                 transition(AgentState.FAILED)
                 failure_kind = (
@@ -181,6 +279,16 @@ class AgentLoop:
                 )
 
             step_count += 1
+            trace(
+                "model_request_started",
+                {
+                    "step": step_count,
+                    **history_summary(visible_history),
+                    "context_chars": self._context_policy.estimate_chars(
+                        visible_history
+                    ),
+                },
+            )
             try:
                 response = self._model.complete(
                     visible_history,
@@ -220,6 +328,16 @@ class AgentLoop:
                     ),
                 )
 
+            trace(
+                "model_response_received",
+                {
+                    "step": step_count,
+                    **model_response_payload(response),
+                },
+            )
+            for call in response.tool_calls:
+                trace("tool_call_received", tool_call_payload(call))
+
             history.append(
                 Message(
                     role=Role.ASSISTANT,
@@ -256,47 +374,102 @@ class AgentLoop:
                         )
                     tool_call_count += 1
                     history.append(_tool_message(result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(result, executed=False),
+                    )
                 continue
 
             if completion_calls:
                 call = completion_calls[0]
                 transition(AgentState.EXECUTING)
-                request_result = self._tools.execute(call)
+                trace("tool_execution_started", tool_call_payload(call))
+                try:
+                    request_result = self._tools.execute(call)
+                except KeyboardInterrupt:
+                    trace(
+                        "tool_execution_finished",
+                        {
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "executed": True,
+                            "cancelled": True,
+                        },
+                    )
+                    transition(AgentState.CANCELLED)
+                    return finish(
+                        "",
+                        error=AgentError(
+                            kind=ErrorKind.CANCELLED,
+                            message="agent run cancelled during completion request",
+                        ),
+                    )
                 tool_call_count += 1
                 if not request_result.ok:
                     history.append(_tool_message(request_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(request_result),
+                    )
                     continue
 
                 summary = str(call.arguments["summary"])
                 remaining_risks = str(call.arguments.get("remaining_risks", ""))
+                trace(
+                    "completion_requested",
+                    {
+                        "call_id": call.id,
+                        "summary_length_chars": len(summary),
+                        "remaining_risks_length_chars": len(remaining_risks),
+                    },
+                )
                 if (
                     self._verification_gate is None
                     or not self._verification_gate.spec.commands
                 ):
-                    history.append(
-                        _tool_message(
-                            _unverified_completion_result(
-                                call,
-                                summary=summary,
-                                remaining_risks=remaining_risks,
-                            )
-                        )
+                    completion_result = _unverified_completion_result(
+                        call,
+                        summary=summary,
+                        remaining_risks=remaining_risks,
+                    )
+                    history.append(_tool_message(completion_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(completion_result),
                     )
                     transition(AgentState.COMPLETED_UNVERIFIED)
                     return finish(summary)
 
                 transition(AgentState.VERIFYING)
+                trace(
+                    "verification_started",
+                    {
+                        "call_id": call.id,
+                        "mutation_seq": mutation_seq,
+                        "command_count": len(
+                            self._verification_gate.spec.commands
+                        ),
+                    },
+                )
                 try:
                     final_verification = self._verification_gate.run_final(
                         mutation_seq=mutation_seq
                     )
                 except KeyboardInterrupt:
+                    trace(
+                        "verification_finished",
+                        {"call_id": call.id, "cancelled": True},
+                    )
                     failure = make_tool_failure(
                         call,
                         ErrorKind.CANCELLED,
                         "verification was cancelled",
                     )
                     history.append(_tool_message(failure))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(failure),
+                    )
                     transition(AgentState.CANCELLED)
                     return finish(
                         "",
@@ -306,12 +479,24 @@ class AgentLoop:
                         ),
                     )
                 except Exception as exc:
+                    trace(
+                        "verification_finished",
+                        {
+                            "call_id": call.id,
+                            "error_kind": ErrorKind.INTERNAL_ERROR.value,
+                            "error_type": type(exc).__name__,
+                        },
+                    )
                     failure = make_tool_failure(
                         call,
                         ErrorKind.INTERNAL_ERROR,
                         f"unexpected verification error: {type(exc).__name__}: {exc}",
                     )
                     history.append(_tool_message(failure))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(failure),
+                    )
                     transition(AgentState.FAILED)
                     return finish(
                         "",
@@ -321,19 +506,28 @@ class AgentLoop:
                         ),
                     )
 
+                trace(
+                    "verification_finished",
+                    {
+                        "call_id": call.id,
+                        **verification_result_payload(final_verification),
+                    },
+                )
+
                 if self._verification_gate.grants_verified(
                     final_verification,
                     mutation_seq=mutation_seq,
                 ):
                     verified_seq = final_verification.verified_seq
-                    history.append(
-                        _tool_message(
-                            _verification_tool_result(
-                                call,
-                                final_verification,
-                                verified=True,
-                            )
-                        )
+                    completion_result = _verification_tool_result(
+                        call,
+                        final_verification,
+                        verified=True,
+                    )
+                    history.append(_tool_message(completion_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(completion_result),
                     )
                     transition(AgentState.VERIFIED)
                     return finish(summary)
@@ -356,22 +550,23 @@ class AgentLoop:
                     and same_failure_count
                     >= self._verification_gate.spec.max_same_failure
                 ):
-                    history.append(
-                        _tool_message(
-                            _verification_tool_result(
-                                call,
-                                final_verification,
-                                verified=False,
-                                retryable=False,
-                                remaining_repair_rounds=(
-                                    self._verification_gate.spec.max_repair_rounds
-                                    - repair_rounds_used
-                                ),
-                                terminal_state=AgentState.STALLED,
-                                error_kind_override=ErrorKind.STALLED,
-                                same_failure_count=same_failure_count,
-                            )
-                        )
+                    completion_result = _verification_tool_result(
+                        call,
+                        final_verification,
+                        verified=False,
+                        retryable=False,
+                        remaining_repair_rounds=(
+                            self._verification_gate.spec.max_repair_rounds
+                            - repair_rounds_used
+                        ),
+                        terminal_state=AgentState.STALLED,
+                        error_kind_override=ErrorKind.STALLED,
+                        same_failure_count=same_failure_count,
+                    )
+                    history.append(_tool_message(completion_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(completion_result),
                     )
                     transition(AgentState.STALLED)
                     return finish(
@@ -391,32 +586,42 @@ class AgentLoop:
                         max_repair_rounds - repair_rounds_used
                     )
                     repair_rounds_used += 1
-                    history.append(
-                        _tool_message(
-                            _verification_tool_result(
-                                call,
-                                final_verification,
-                                verified=False,
-                                retryable=True,
-                                remaining_repair_rounds=remaining_repair_rounds,
-                                same_failure_count=same_failure_count,
-                            )
-                        )
+                    completion_result = _verification_tool_result(
+                        call,
+                        final_verification,
+                        verified=False,
+                        retryable=True,
+                        remaining_repair_rounds=remaining_repair_rounds,
+                        same_failure_count=same_failure_count,
+                    )
+                    history.append(_tool_message(completion_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(completion_result),
                     )
                     transition(AgentState.RECOVERING)
+                    trace(
+                        "recovery_started",
+                        {
+                            "repair_round": repair_rounds_used,
+                            "remaining_repair_rounds": remaining_repair_rounds,
+                            "failure_signature": failure_signature,
+                        },
+                    )
                     continue
 
-                history.append(
-                    _tool_message(
-                        _verification_tool_result(
-                            call,
-                            final_verification,
-                            verified=False,
-                            retryable=False,
-                            remaining_repair_rounds=0,
-                            same_failure_count=same_failure_count,
-                        )
-                    )
+                completion_result = _verification_tool_result(
+                    call,
+                    final_verification,
+                    verified=False,
+                    retryable=False,
+                    remaining_repair_rounds=0,
+                    same_failure_count=same_failure_count,
+                )
+                history.append(_tool_message(completion_result))
+                trace(
+                    "tool_execution_finished",
+                    tool_result_payload(completion_result),
                 )
                 transition(AgentState.VERIFICATION_FAILED)
                 return finish(
@@ -429,9 +634,19 @@ class AgentLoop:
 
             transition(AgentState.EXECUTING)
             for call in response.tool_calls:
+                trace("tool_execution_started", tool_call_payload(call))
                 try:
                     result = self._tools.execute(call)
                 except KeyboardInterrupt:
+                    trace(
+                        "tool_execution_finished",
+                        {
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "executed": True,
+                            "cancelled": True,
+                        },
+                    )
                     transition(AgentState.CANCELLED)
                     return finish(
                         "",
@@ -441,9 +656,20 @@ class AgentLoop:
                         ),
                     )
                 tool_call_count += 1
+                trace("tool_execution_finished", tool_result_payload(result))
                 if result.invalidates_verification:
+                    previous_mutation_seq = mutation_seq
                     mutation_seq += 1
                     verified_seq = None
+                    trace(
+                        "workspace_revision_changed",
+                        {
+                            "call_id": call.id,
+                            "tool_name": call.name,
+                            "previous_mutation_seq": previous_mutation_seq,
+                            "mutation_seq": mutation_seq,
+                        },
+                    )
                 history.append(_tool_message(result))
 
 
