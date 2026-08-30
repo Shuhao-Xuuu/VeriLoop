@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Mapping, Sequence
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from enum import Enum
 import hashlib
@@ -97,6 +97,14 @@ class ReplayError(ValueError):
     """A saved trace cannot be replayed as trustworthy read-only evidence."""
 
 
+@dataclass(frozen=True, slots=True)
+class _PendingTextPreview:
+    """Keep full text until TraceWriter has applied credential redaction."""
+
+    text: str
+    limit: int = TRACE_TEXT_PREVIEW_CHARS
+
+
 class Redactor:
     """Apply small deterministic redactions without pretending to be DLP."""
 
@@ -119,6 +127,8 @@ class Redactor:
         )
 
     def value(self, value: Any) -> Any:
+        if isinstance(value, _PendingTextPreview):
+            return _PendingTextPreview(self.text(value.text), value.limit)
         if isinstance(value, str):
             return self.text(value)
         if isinstance(value, Mapping):
@@ -447,8 +457,8 @@ def tool_result_payload(
     try:
         parsed_content = json.loads(result.content)
     except (json.JSONDecodeError, TypeError):
-        content_preview, content_truncated = _preview_text(result.content)
-        content: Any = content_preview
+        content: Any = _PendingTextPreview(result.content)
+        content_truncated = len(result.content) > TRACE_TEXT_PREVIEW_CHARS
     else:
         content, content_truncated = _summarize_output_value(parsed_content)
     metadata, metadata_truncated = _summarize_output_value(result.metadata)
@@ -477,9 +487,8 @@ def model_response_payload(response: ModelResponse) -> dict[str, Any]:
         "text_length_chars": len(response.text),
     }
     if not response.tool_calls:
-        text_preview, truncated = _preview_text(response.text)
-        payload["text_preview"] = text_preview
-        payload["text_truncated"] = truncated
+        payload["text_preview"] = _PendingTextPreview(response.text)
+        payload["text_truncated"] = len(response.text) > TRACE_TEXT_PREVIEW_CHARS
     return payload
 
 
@@ -512,13 +521,15 @@ def verification_result_payload(result: VerificationResult) -> dict[str, Any]:
                     if command.error_kind is not None
                     else None
                 ),
-                "stdout_preview": _preview_text(command.stdout)[0],
-                "stderr_preview": _preview_text(command.stderr)[0],
+                "stdout_preview": _PendingTextPreview(command.stdout),
+                "stderr_preview": _PendingTextPreview(command.stderr),
                 "stdout_truncated": (
-                    command.stdout_truncated or _preview_text(command.stdout)[1]
+                    command.stdout_truncated
+                    or len(command.stdout) > TRACE_TEXT_PREVIEW_CHARS
                 ),
                 "stderr_truncated": (
-                    command.stderr_truncated or _preview_text(command.stderr)[1]
+                    command.stderr_truncated
+                    or len(command.stderr) > TRACE_TEXT_PREVIEW_CHARS
                 ),
             }
             for command in result.commands
@@ -1244,7 +1255,10 @@ def _summarize_output_value(
     if depth >= 8:
         return TRACE_TRUNCATION_MARKER, True
     if isinstance(value, str):
-        return _preview_text(value)
+        return (
+            _PendingTextPreview(value),
+            len(value) > TRACE_TEXT_PREVIEW_CHARS,
+        )
     if value is None or isinstance(value, (bool, int, float)):
         return value, False
     if isinstance(value, Enum):
@@ -1292,6 +1306,8 @@ def _summarize_output_value(
 def _bounded_value(value: Any, *, depth: int = 0) -> Any:
     if depth >= 8:
         return TRACE_TRUNCATION_MARKER
+    if isinstance(value, _PendingTextPreview):
+        return _preview_text(value.text, value.limit)[0]
     if isinstance(value, str):
         return _preview_text(value, TRACE_GENERIC_STRING_CHARS)[0]
     if value is None or isinstance(value, (bool, int, float)):

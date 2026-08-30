@@ -19,6 +19,7 @@ from veriloop.model import (
 )
 from veriloop.process import CommandPolicy, CommandRunner
 from veriloop.protocol import (
+    AgentResult,
     AgentState,
     ErrorKind,
     FinishReason,
@@ -46,6 +47,7 @@ from veriloop.trace import (
     TRACE_TRUNCATION_MARKER,
     TraceError,
     TraceWriter,
+    model_response_payload,
     tool_call_payload,
     tool_result_payload,
     verification_result_payload,
@@ -439,6 +441,123 @@ def test_tool_output_and_verification_streams_are_bounded(tmp_path: Path) -> Non
     assert events[1]["payload"]["protected_changes"] == [
         {"kind": "modified", "path": "tests/test_value.py"}
     ]
+
+
+def test_known_secret_is_redacted_before_any_trace_preview(
+    tmp_path: Path,
+) -> None:
+    secret = "veriloop-boundary-secret-" + ("s" * 96)
+    available = TRACE_TEXT_PREVIEW_CHARS - len(TRACE_TRUNCATION_MARKER)
+    preview_head = (available + 1) // 2
+    text = (
+        ("x" * (preview_head - 48))
+        + secret
+        + ("y" * TRACE_TEXT_PREVIEW_CHARS)
+    )
+    bearer_token = "veriloop-boundary-bearer-" + ("b" * 96)
+    bearer_prefix = "Authorization: Bearer "
+    bearer_text = (
+        ("x" * (preview_head - len(bearer_prefix) - 48))
+        + bearer_prefix
+        + bearer_token
+        + " "
+        + ("y" * TRACE_TEXT_PREVIEW_CHARS)
+    )
+    command = VerificationCommandResult(
+        argv=("python", "verify.py", text),
+        cwd=text,
+        exit_code=1,
+        timed_out=False,
+        started=True,
+        stdout=text,
+        stderr=text,
+        stdout_truncated=False,
+        stderr_truncated=False,
+        duration_ms=1,
+        error_kind=ErrorKind.VERIFICATION_FAILED,
+    )
+    verification = VerificationResult(
+        phase=VerificationPhase.FINAL,
+        passed=False,
+        commands=(command,),
+        protected_unchanged=True,
+        protected_changes=(),
+        mutation_seq=0,
+        verified_seq=None,
+        failure_kind=ErrorKind.VERIFICATION_FAILED,
+        failure_signature="failure",
+    )
+    writer = TraceWriter(
+        tmp_path,
+        run_id="redact-before-preview",
+        known_secrets=(secret,),
+        artifact_runner=RecordingArtifactRunner(
+            "",
+            repository_error=ErrorKind.COMMAND_NONZERO_EXIT,
+        ),
+    )
+    writer.emit(
+        "tool_call_received",
+        AgentState.EXECUTING,
+        tool_call_payload(
+            ToolCall(
+                id=text,
+                name=text,
+                arguments={"path": text},
+            )
+        ),
+    )
+    writer.emit(
+        "tool_execution_finished",
+        AgentState.EXECUTING,
+        tool_result_payload(
+            ToolResult(
+                call_id=text,
+                tool_name=text,
+                ok=False,
+                content=text,
+                metadata={"stdout": text},
+            )
+        ),
+    )
+    writer.emit(
+        "model_response_received",
+        AgentState.THINKING,
+        model_response_payload(response(text)),
+    )
+    writer.emit(
+        "model_response_received",
+        AgentState.THINKING,
+        model_response_payload(response(bearer_text)),
+    )
+    writer.emit(
+        "verification_finished",
+        AgentState.VERIFYING,
+        verification_result_payload(verification),
+    )
+    writer.close()
+    writer.write_artifacts(
+        AgentResult(
+            state=AgentState.VERIFICATION_FAILED,
+            final_message=text,
+            step_count=1,
+            tool_call_count=1,
+            history=(),
+            final_verification=verification,
+        )
+    )
+
+    persisted = (
+        writer.events_path.read_text(encoding="utf-8")
+        + writer.result_path.read_text(encoding="utf-8")
+    )
+    assert secret not in persisted
+    assert secret[:48] not in persisted
+    assert secret[-48:] not in persisted
+    assert bearer_token not in persisted
+    assert bearer_token[:48] not in persisted
+    assert bearer_token[-48:] not in persisted
+    assert REDACTION_MARKER in persisted
 
 
 def test_plain_final_agent_lifecycle_is_redacted_and_finished(tmp_path: Path) -> None:
