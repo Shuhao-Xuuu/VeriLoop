@@ -141,6 +141,77 @@ class VerificationGate:
             verified_seq=None,
         )
 
+    def run_final(self, *, mutation_seq: int) -> VerificationResult:
+        before_changes = self.protected_changes()
+        if not self.spec.commands:
+            return VerificationResult(
+                phase=VerificationPhase.FINAL,
+                passed=False,
+                commands=(),
+                protected_unchanged=not before_changes,
+                protected_changes=before_changes,
+                mutation_seq=mutation_seq,
+                verified_seq=None,
+                failure_kind=(
+                    ErrorKind.PROTECTED_FILE_CHANGED
+                    if before_changes
+                    else ErrorKind.VERIFICATION_FAILED
+                ),
+            )
+
+        commands = tuple(
+            _run_verification_command(self._runner, command)
+            for command in self.spec.commands
+        )
+        after_changes = self.protected_changes()
+        protected_changes = _merge_protected_changes(before_changes, after_changes)
+
+        if protected_changes:
+            failure_kind = ErrorKind.PROTECTED_FILE_CHANGED
+        elif any(not command.started for command in commands):
+            failure_kind = ErrorKind.VERIFICATION_START_ERROR
+        elif any(command.timed_out for command in commands):
+            failure_kind = ErrorKind.VERIFICATION_TIMEOUT
+        elif any(command.exit_code != 0 for command in commands):
+            failure_kind = ErrorKind.VERIFICATION_FAILED
+        else:
+            failure_kind = None
+
+        passed = failure_kind is None
+        return VerificationResult(
+            phase=VerificationPhase.FINAL,
+            passed=passed,
+            commands=commands,
+            protected_unchanged=not protected_changes,
+            protected_changes=protected_changes,
+            mutation_seq=mutation_seq,
+            verified_seq=mutation_seq if passed else None,
+            failure_kind=failure_kind,
+        )
+
+    def grants_verified(
+        self,
+        result: VerificationResult,
+        *,
+        mutation_seq: int,
+    ) -> bool:
+        """Apply every host-owned invariant required for VERIFIED."""
+
+        return (
+            bool(self.spec.commands)
+            and result.phase is VerificationPhase.FINAL
+            and result.passed
+            and bool(result.commands)
+            and len(result.commands) == len(self.spec.commands)
+            and all(command.started for command in result.commands)
+            and all(not command.timed_out for command in result.commands)
+            and all(command.exit_code == 0 for command in result.commands)
+            and result.protected_unchanged
+            and not result.protected_changes
+            and result.verified_seq == mutation_seq
+            and result.mutation_seq == mutation_seq
+        )
+
 
 def load_verification_spec(
     guard: WorkspaceGuard,
@@ -280,6 +351,17 @@ def compare_protected_manifests(
             continue
         changes.append(ProtectedFileChange(relative_path=relative, kind=kind))
     return tuple(changes)
+
+
+def _merge_protected_changes(
+    *groups: tuple[ProtectedFileChange, ...],
+) -> tuple[ProtectedFileChange, ...]:
+    unique = {
+        (change.relative_path, change.kind.value): change
+        for group in groups
+        for change in group
+    }
+    return tuple(unique[key] for key in sorted(unique))
 
 
 def protected_guard_for_spec(

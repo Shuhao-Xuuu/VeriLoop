@@ -936,3 +936,195 @@ def test_model_run_pytest_success_never_sets_verified_sequence(tmp_path: Path) -
     assert result.mutation_seq == 1
     assert result.verified_seq is None
     assert result.state is AgentState.COMPLETED_UNVERIFIED
+
+
+def test_final_gate_grants_only_all_green_fresh_host_evidence(tmp_path: Path) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+
+    result = verification_gate.run_final(mutation_seq=4)
+
+    assert result.passed is True
+    assert result.commands[0].started is True
+    assert result.commands[0].exit_code == 0
+    assert result.protected_unchanged is True
+    assert result.verified_seq == 4
+    assert verification_gate.grants_verified(result, mutation_seq=4) is True
+    assert verification_gate.grants_verified(result, mutation_seq=5) is False
+
+
+def test_final_gate_without_commands_cannot_grant_verified(tmp_path: Path) -> None:
+    guard, runner, spec = loaded_components(tmp_path)
+    verification_gate = VerificationGate(spec, runner)
+
+    result = verification_gate.run_final(mutation_seq=0)
+
+    assert result.passed is False
+    assert result.verified_seq is None
+    assert result.failure_kind is ErrorKind.VERIFICATION_FAILED
+    assert verification_gate.grants_verified(result, mutation_seq=0) is False
+    assert guard.root == tmp_path.resolve()
+
+
+def test_final_gate_runs_all_commands_in_order_and_rejects_any_nonzero(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "first.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    (tmp_path / "second.py").write_text("raise SystemExit(6)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "first.py"]
+[[verification.commands]]
+argv = ["python", "second.py"]
+""",
+    )
+
+    result = verification_gate.run_final(mutation_seq=2)
+
+    assert [command.argv[-1] for command in result.commands] == [
+        "first.py",
+        "second.py",
+    ]
+    assert [command.exit_code for command in result.commands] == [0, 6]
+    assert result.failure_kind is ErrorKind.VERIFICATION_FAILED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=2) is False
+
+
+def test_final_gate_timeout_cannot_grant_verified(tmp_path: Path) -> None:
+    (tmp_path / "slow.py").write_text("import time\ntime.sleep(30)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "slow.py"]
+timeout_seconds = 1
+""",
+    )
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.failure_kind is ErrorKind.VERIFICATION_TIMEOUT
+    assert result.commands[0].timed_out is True
+    assert result.commands[0].started is True
+    assert result.verified_seq is None
+
+
+def test_final_gate_start_error_cannot_grant_verified(
+    tmp_path: Path, monkeypatch
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+
+    def fail_to_start(*args, **kwargs):
+        raise OSError("fictional start failure")
+
+    monkeypatch.setattr("veriloop.process.subprocess.Popen", fail_to_start)
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.failure_kind is ErrorKind.VERIFICATION_START_ERROR
+    assert result.commands[0].started is False
+    assert result.verified_seq is None
+
+
+def test_final_gate_rejects_preexisting_protected_change_even_when_green(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "protected.txt"
+    protected.write_text("original\n", encoding="utf-8")
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+protected_globs = ["protected.txt"]
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    protected.write_text("tampered\n", encoding="utf-8")
+
+    result = verification_gate.run_final(mutation_seq=3)
+
+    assert result.commands[0].exit_code == 0
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.protected_changes == (
+        ProtectedFileChange("protected.txt", ProtectedChangeKind.MODIFIED),
+    )
+    assert result.verified_seq is None
+
+
+def test_final_gate_detects_protected_change_caused_by_verification_command(
+    tmp_path: Path,
+) -> None:
+    protected = tmp_path / "protected.txt"
+    protected.write_text("original\n", encoding="utf-8")
+    (tmp_path / "mutating_check.py").write_text(
+        "from pathlib import Path\nPath('protected.txt').write_text('changed\\n')\n",
+        encoding="utf-8",
+    )
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+protected_globs = ["protected.txt"]
+[[verification.commands]]
+argv = ["python", "mutating_check.py"]
+""",
+    )
+
+    result = verification_gate.run_final(mutation_seq=8)
+
+    assert result.commands[0].exit_code == 0
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.protected_unchanged is False
+    assert result.verified_seq is None
+    assert result.mutation_seq == 8
+
+
+def test_final_gate_uses_frozen_commands_and_rejects_changed_config(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+    verification_gate = gate(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+    )
+    write_config(tmp_path, "[verification]\nbaseline_policy = \"skip\"\n")
+
+    result = verification_gate.run_final(mutation_seq=0)
+
+    assert len(result.commands) == 1
+    assert result.commands[0].argv[-1] == "verify.py"
+    assert result.commands[0].exit_code == 0
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
