@@ -51,6 +51,16 @@ class ErrorKind(str, Enum):
     COMMAND_TIMEOUT = "command_timeout"
     COMMAND_NONZERO_EXIT = "command_nonzero_exit"
     COMMAND_START_ERROR = "command_start_error"
+    INVALID_VERIFICATION_CONFIG = "invalid_verification_config"
+    BASELINE_UNEXPECTED_PASS = "baseline_unexpected_pass"
+    BASELINE_INFRASTRUCTURE_ERROR = "baseline_infrastructure_error"
+    VERIFICATION_FAILED = "verification_failed"
+    VERIFICATION_TIMEOUT = "verification_timeout"
+    VERIFICATION_START_ERROR = "verification_start_error"
+    PROTECTED_FILE_CHANGED = "protected_file_changed"
+    COMPLETION_MUST_BE_SINGLE_CALL = "completion_must_be_single_call"
+    DEFERRED_REPLAN_REQUIRED = "deferred_replan_required"
+    STALLED = "stalled"
 
 
 @dataclass(frozen=True, slots=True)
@@ -89,12 +99,73 @@ class Message:
 
 class AgentState(str, Enum):
     INITIALIZING = "initializing"
+    BASELINE_VERIFYING = "baseline_verifying"
     THINKING = "thinking"
     EXECUTING = "executing"
+    VERIFYING = "verifying"
+    RECOVERING = "recovering"
+    VERIFIED = "verified"
     COMPLETED_UNVERIFIED = "completed_unverified"
+    VERIFICATION_FAILED = "verification_failed"
+    STALLED = "stalled"
     FAILED = "failed"
     MAX_STEPS = "max_steps"
     CANCELLED = "cancelled"
+
+
+class VerificationPhase(str, Enum):
+    BASELINE = "baseline"
+    FINAL = "final"
+
+
+class ProtectedChangeKind(str, Enum):
+    CREATED = "created"
+    DELETED = "deleted"
+    MODIFIED = "modified"
+    REPLACED = "replaced"
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedFileRecord:
+    relative_path: str
+    existed: bool
+    size: int | None
+    sha256: str | None
+
+
+@dataclass(frozen=True, slots=True)
+class ProtectedFileChange:
+    relative_path: str
+    kind: ProtectedChangeKind
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationCommandResult:
+    argv: tuple[str, ...]
+    cwd: str
+    exit_code: int | None
+    timed_out: bool
+    started: bool
+    stdout: str
+    stderr: str
+    stdout_truncated: bool
+    stderr_truncated: bool
+    duration_ms: int
+    error_kind: ErrorKind | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class VerificationResult:
+    phase: VerificationPhase
+    passed: bool
+    commands: tuple[VerificationCommandResult, ...]
+    protected_unchanged: bool
+    protected_changes: tuple[ProtectedFileChange, ...]
+    mutation_seq: int
+    verified_seq: int | None
+    failure_kind: ErrorKind | None = None
+    failure_signature: str | None = None
+    skipped: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -112,3 +183,16 @@ class AgentResult:
     tool_call_count: int
     history: tuple[Message, ...]
     error: AgentError | None = None
+    mutation_seq: int = 0
+    verified_seq: int | None = None
+    repair_rounds_used: int = 0
+    baseline_verification: VerificationResult | None = None
+    final_verification: VerificationResult | None = None
+    changed_files: tuple[str, ...] = ()
+    run_id: str | None = None
+    trace_path: str | None = None
+    result_path: str | None = None
+    patch_path: str | None = None
+    duration_ms: int = 0
+    model_usage: dict[str, int] = field(default_factory=dict)
+    state_history: tuple[AgentState, ...] = ()

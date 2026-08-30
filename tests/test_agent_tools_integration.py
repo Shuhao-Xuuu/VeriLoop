@@ -160,7 +160,7 @@ print('behavior is correct')
         Role.TOOL,
         Role.ASSISTANT,
     ]
-    assert not hasattr(AgentState, "VERIFIED")
+    assert result.state is not AgentState.VERIFIED
 
 
 def test_stale_sha_failure_enters_history_and_model_recovers(tmp_path: Path) -> None:
@@ -242,7 +242,7 @@ def test_stale_sha_failure_enters_history_and_model_recovers(tmp_path: Path) -> 
     assert stale_seen_next_turn.call_id == "edit-stale"
     assert stale_seen_next_turn.error_kind is ErrorKind.STALE_FILE
     assert "stale_file" in stale_seen_next_turn.content
-    assert not hasattr(AgentState, "VERIFIED")
+    assert result.state is not AgentState.VERIFIED
 
 
 def test_command_timeout_is_visible_and_does_not_break_agent_loop(tmp_path: Path) -> None:
