@@ -20,12 +20,12 @@ The production registry exposes seven tools:
 - `complete_task` for requesting host acceptance.
 
 `complete_task` does not declare success. At run startup, the CLI loads and
-freezes a `VerificationSpec`, protects configured inputs, records their
-manifest, and runs the configured baseline before the first model request. A
-standalone `complete_task` request causes the host Gate to run the frozen final
-commands. `VERIFIED` is possible only when every command starts, avoids
-timeout, exits zero, protected inputs are unchanged, and
-`verified_seq == mutation_seq`.
+freezes a `VerificationSpec`, protects user-configured inputs and host-derived
+verifier control inputs, records their manifest, and runs the configured
+baseline before the first model request. A standalone `complete_task` request
+causes the host Gate to run the frozen final commands. `VERIFIED` is possible
+only when every command starts, avoids timeout, exits zero, protected inputs
+are unchanged, and `verified_seq == mutation_seq`.
 
 Successful file mutations and every ordinary command that actually starts
 advance `mutation_seq` and invalidate prior verification. A failed final check
@@ -68,6 +68,7 @@ The default config path is the workspace-relative `.veriloop.toml`:
 baseline_policy = "record_only"
 max_repair_rounds = 2
 max_same_failure = 2
+# User-declared inputs; Python/pytest verifier controls are added automatically.
 protected_globs = ["tests/**"]
 
 [[verification.commands]]
@@ -85,8 +86,13 @@ Baseline policies are:
 
 The config file itself is automatically protected. Configured commands, cwd,
 timeouts, repair limits, and protected globs are validated and frozen before the
-model is created. Missing config or an empty command list is valid, but it
-cannot produce `VERIFIED`.
+model is created. Configured Python commands also add workspace-controlled
+module shadows and interpreter startup hooks to that frozen boundary. Pytest
+commands additionally add its workspace configuration, `conftest.py`, and
+plugin-discovery metadata candidates. This includes candidates that do not yet
+exist: file tools deny their creation, and the final manifest detects creation
+or change by an allowed process. Missing config or an empty command list is
+valid, but it cannot produce `VERIFIED`.
 
 ## CLI
 

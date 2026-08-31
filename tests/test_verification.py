@@ -182,7 +182,11 @@ timeout_seconds = 90
     assert spec.baseline_policy is BaselinePolicy.MUST_FAIL
     assert spec.max_repair_rounds == 3
     assert spec.max_same_failure == 4
-    assert spec.protected_globs == ("tests/**", ".veriloop.toml")
+    assert spec.protected_globs[:2] == ("tests/**", ".veriloop.toml")
+    assert "pytest.py" in spec.protected_globs
+    assert "sitecustomize.py" in spec.protected_globs
+    assert "conftest.py" in spec.protected_globs
+    assert "pytest.ini" in spec.protected_globs
     assert spec.commands[0].argv == ("python", "-m", "pytest", "-q")
     assert spec.commands[0].cwd == "."
     assert spec.commands[0].timeout_seconds == 90
@@ -215,6 +219,252 @@ argv = ["python", "-m", "pytest", "-q"]
 
     assert spec.baseline_policy is BaselinePolicy.SKIP
     assert len(spec.commands) == 1
+
+
+@pytest.mark.parametrize(
+    "relative_path",
+    [
+        "pytest.py",
+        "PyTeSt.py",
+        "sitecustomize.py",
+        "nested/usercustomize.py",
+        "conftest.py",
+        "pytest.ini",
+        "nested/pyproject.toml",
+    ],
+)
+def test_python_pytest_verifier_controls_are_implicitly_write_protected(
+    tmp_path: Path,
+    relative_path: str,
+) -> None:
+    (tmp_path / "nested").mkdir()
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": relative_path,
+            "content": "control = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / relative_path).exists()
+
+
+def test_gate_rejects_command_side_creation_of_pytest_module_shadow(
+    tmp_path: Path,
+) -> None:
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+    (tmp_path / "pytest.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.commands[0].exit_code == 0
+    assert result.passed is False
+    assert result.protected_unchanged is False
+    assert result.protected_changes == (
+        ProtectedFileChange("pytest.py", ProtectedChangeKind.CREATED),
+    )
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=1) is False
+
+
+@pytest.mark.parametrize(
+    "config_arguments",
+    [
+        ["-c", "verifier.ini"],
+        ["-cverifier.ini"],
+        ["--config-file", "verifier.ini"],
+        ["--config-file=verifier.ini"],
+    ],
+)
+def test_explicit_pytest_config_is_implicitly_write_protected(
+    tmp_path: Path,
+    config_arguments: list[str],
+) -> None:
+    command_dir = tmp_path / "checks"
+    command_dir.mkdir()
+    argv = ["python", "-m", "pytest", "-q", *config_arguments]
+    registry, _ = verification_stack(
+        tmp_path,
+        "\n".join(
+            [
+                "[verification]",
+                'baseline_policy = "skip"',
+                "[[verification.commands]]",
+                f"argv = {json.dumps(argv)}",
+                'cwd = "checks"',
+            ]
+        ),
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "checks/verifier.ini",
+            "content": "[pytest]\naddopts = --collect-only\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (command_dir / "verifier.ini").exists()
+
+
+def test_explicit_pytest_config_outside_workspace_is_rejected(
+    tmp_path: Path,
+) -> None:
+    outside = tmp_path.parent / "outside-verifier.ini"
+    write_config(
+        tmp_path,
+        "\n".join(
+            [
+                "[verification]",
+                'baseline_policy = "skip"',
+                "[[verification.commands]]",
+                "argv = "
+                + json.dumps(["python", "-m", "pytest", "-c", str(outside)]),
+            ]
+        ),
+    )
+
+    with pytest.raises(VerificationConfigError, match="stay inside the workspace"):
+        load(tmp_path)
+
+
+@pytest.mark.parametrize(
+    "plugin_arguments",
+    [
+        ["-p", "verifier_plugin"],
+        ["-pverifier_plugin"],
+    ],
+)
+def test_explicit_pytest_plugin_module_is_implicitly_write_protected(
+    tmp_path: Path,
+    plugin_arguments: list[str],
+) -> None:
+    argv = ["python", "-m", "pytest", "-q", *plugin_arguments]
+    registry, _ = verification_stack(
+        tmp_path,
+        "\n".join(
+            [
+                "[verification]",
+                'baseline_policy = "skip"',
+                "[[verification.commands]]",
+                f"argv = {json.dumps(argv)}",
+            ]
+        ),
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "verifier_plugin.py",
+            "content": "def pytest_sessionfinish(session):\n    session.exitstatus = 0\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+def test_pytest_config_declared_plugin_is_implicitly_write_protected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pytest.ini").write_text(
+        "[pytest]\naddopts = -p verifier_plugin\n",
+        encoding="utf-8",
+    )
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "verifier_plugin.py",
+            "content": "def pytest_sessionfinish(session):\n    session.exitstatus = 0\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+def test_gate_manifests_pytest_shadow_inside_skipped_command_cwd(
+    tmp_path: Path,
+) -> None:
+    command_dir = tmp_path / ".venv"
+    command_dir.mkdir()
+    protected_test = command_dir / "test_still_red.py"
+    protected_test.write_text(
+        "def test_still_red():\n    assert False\n",
+        encoding="utf-8",
+    )
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+protected_globs = [".venv/test_still_red.py"]
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+cwd = ".venv"
+""",
+    )
+    baseline = verification_gate.run_baseline()
+    assert baseline.passed is True
+    assert baseline.commands[0].exit_code not in (None, 0)
+    (command_dir / "pytest.py").write_text(
+        "raise SystemExit(0)\n",
+        encoding="utf-8",
+    )
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.commands[0].exit_code == 0
+    assert result.passed is False
+    assert result.protected_changes == (
+        ProtectedFileChange(".venv/pytest.py", ProtectedChangeKind.CREATED),
+    )
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=1) is False
 
 
 @pytest.mark.parametrize(

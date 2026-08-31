@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import ast
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
@@ -10,6 +11,7 @@ import os
 from pathlib import Path
 import re
 import stat
+import sys
 import tempfile
 import tomllib
 from typing import Any, Sequence
@@ -38,6 +40,42 @@ DEFAULT_CONFIG_PATH = ".veriloop.toml"
 DEFAULT_MAX_REPAIR_ROUNDS = 2
 DEFAULT_MAX_SAME_FAILURE = 2
 
+_PYTHON_STARTUP_CONTROL_FILES = (
+    "sitecustomize.py",
+    "usercustomize.py",
+)
+_PYTEST_CONTROL_FILES = (
+    "conftest.py",
+    "pytest.toml",
+    ".pytest.toml",
+    "pytest.ini",
+    ".pytest.ini",
+    "pyproject.toml",
+    "tox.ini",
+    "setup.cfg",
+)
+_PYTEST_PLUGIN_METADATA_FILES = (
+    "*.dist-info/entry_points.txt",
+    "*.egg-info/entry_points.txt",
+)
+_MANIFEST_SKIPPED_DIRECTORIES = frozenset(
+    {
+        ".git",
+        ".veriloop",
+        "__pycache__",
+        ".pytest_cache",
+        ".ruff_cache",
+        ".mypy_cache",
+    }
+)
+_PYTHON_MODULE_NAME = re.compile(
+    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z"
+)
+_PYTEST_PLUGIN_OPTION = re.compile(
+    r"(?<![A-Za-z0-9_-])-p(?:[\s\"',\[\]]*)"
+    r"(?P<name>(?:no:)?[A-Za-z_][A-Za-z0-9_.-]*)"
+)
+
 
 class BaselinePolicy(str, Enum):
     MUST_FAIL = "must_fail"
@@ -59,6 +97,7 @@ class VerificationSpec:
     max_repair_rounds: int
     max_same_failure: int
     protected_globs: tuple[str, ...]
+    verifier_control_paths: tuple[str, ...]
     config_path: str | None
 
 
@@ -319,14 +358,17 @@ def load_verification_spec(
         raw_verification.get("max_same_failure", DEFAULT_MAX_SAME_FAILURE),
         minimum=1,
     )
-    protected_globs = _protected_globs(
+    configured_protected_globs = _protected_globs(
         raw_verification.get("protected_globs", [])
     )
-    commands = _commands(
+    commands, verifier_control_globs, verifier_control_paths = _commands(
         raw_verification.get("commands", []),
         guard=guard,
         runner=runner,
         known_secrets=known_secrets,
+    )
+    protected_globs = tuple(
+        dict.fromkeys((*configured_protected_globs, *verifier_control_globs))
     )
 
     return VerificationSpec(
@@ -335,6 +377,7 @@ def load_verification_spec(
         max_repair_rounds=max_repair_rounds,
         max_same_failure=max_same_failure,
         protected_globs=protected_globs,
+        verifier_control_paths=verifier_control_paths,
         config_path=relative_config,
     )
 
@@ -354,11 +397,13 @@ def build_protected_manifest(
         ):
             records[relative] = _protected_record(path, relative)
 
+    exact_paths = list(spec.verifier_control_paths)
     if spec.config_path is not None:
-        config_path = guard.lexical_path(spec.config_path)
-        records[spec.config_path] = _protected_record(
-            config_path,
-            spec.config_path,
+        exact_paths.append(spec.config_path)
+    for relative in exact_paths:
+        records[relative] = _protected_record(
+            guard.lexical_path(relative),
+            relative,
         )
 
     return tuple(records[path] for path in sorted(records))
@@ -536,7 +581,9 @@ def protected_guard_for_spec(
 ) -> WorkspaceGuard:
     """Create the model-facing guard with frozen verification write denies."""
 
-    exact_paths = (spec.config_path,) if spec.config_path is not None else ()
+    exact_paths = list(spec.verifier_control_paths)
+    if spec.config_path is not None:
+        exact_paths.append(spec.config_path)
     return WorkspaceGuard(
         guard.root,
         max_file_bytes=guard.max_file_bytes,
@@ -552,6 +599,7 @@ def _empty_spec(config_path: str | None) -> VerificationSpec:
         max_repair_rounds=DEFAULT_MAX_REPAIR_ROUNDS,
         max_same_failure=DEFAULT_MAX_SAME_FAILURE,
         protected_globs=(),
+        verifier_control_paths=(),
         config_path=config_path,
     )
 
@@ -615,10 +663,18 @@ def _commands(
     guard: WorkspaceGuard,
     runner: CommandRunner,
     known_secrets: Sequence[str],
-) -> tuple[VerificationCommandSpec, ...]:
+) -> tuple[
+    tuple[VerificationCommandSpec, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+]:
     if not isinstance(value, list):
         raise VerificationConfigError("verification.commands must be an array of tables")
     commands: list[VerificationCommandSpec] = []
+    verifier_control_globs: set[str] = set()
+    verifier_control_paths: set[str] = set()
+    pytest_plugin_names: set[str] = set()
+    has_pytest_command = False
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise VerificationConfigError(
@@ -663,7 +719,15 @@ def _commands(
                 raise VerificationConfigError(
                     f"verification command {index} cwd must be an existing directory"
                 )
-            runner.policy.validate(
+            relative_cwd = guard.relative(cwd_path)
+            if any(
+                part.casefold() in _MANIFEST_SKIPPED_DIRECTORIES
+                for part in Path(relative_cwd).parts
+            ):
+                raise VerificationConfigError(
+                    f"verification command {index} cwd enters runtime metadata or cache"
+                )
+            validated_argv = runner.policy.validate(
                 list(argv),
                 cwd=cwd_path,
                 workspace_root=guard.root,
@@ -675,11 +739,324 @@ def _commands(
         commands.append(
             VerificationCommandSpec(
                 argv=tuple(argv),
-                cwd=guard.relative(cwd_path),
+                cwd=relative_cwd,
                 timeout_seconds=timeout,
             )
         )
-    return tuple(commands)
+        control_globs, control_paths, plugin_names, is_pytest = (
+            _python_verifier_controls(
+                validated_argv,
+                cwd=cwd_path,
+                guard=guard,
+            )
+        )
+        verifier_control_globs.update(control_globs)
+        verifier_control_paths.update(control_paths)
+        pytest_plugin_names.update(plugin_names)
+        has_pytest_command = has_pytest_command or is_pytest
+
+    if has_pytest_command:
+        pytest_plugin_names.update(
+            _workspace_pytest_plugin_names(
+                guard,
+                explicit_config_paths=verifier_control_paths,
+            )
+        )
+        for plugin_name in pytest_plugin_names:
+            verifier_control_globs.update(
+                _python_module_control_globs(plugin_name)
+            )
+
+    return (
+        tuple(commands),
+        tuple(sorted(verifier_control_globs)),
+        tuple(sorted(verifier_control_paths)),
+    )
+
+
+def _python_verifier_controls(
+    argv: tuple[str, ...],
+    *,
+    cwd: Path,
+    guard: WorkspaceGuard,
+) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], bool]:
+    if not argv or argv[0] != sys.executable:
+        return (), (), (), False
+
+    controls: set[str] = set()
+    for name in _PYTHON_STARTUP_CONTROL_FILES:
+        controls.update(_workspace_candidate_globs(name))
+
+    if len(argv) < 3 or argv[1] != "-m":
+        return tuple(sorted(controls)), (), (), False
+
+    module = argv[2]
+    controls.update(_python_module_control_globs(module))
+
+    if module.casefold() != "pytest":
+        return tuple(sorted(controls)), (), (), False
+
+    for name in _PYTEST_CONTROL_FILES:
+        controls.update(_workspace_candidate_globs(name))
+    for name in _PYTEST_PLUGIN_METADATA_FILES:
+        controls.update(_workspace_candidate_globs(name))
+    control_paths, plugin_names = _pytest_argv_controls(
+        argv[3:],
+        cwd=cwd,
+        guard=guard,
+    )
+    return (
+        tuple(sorted(controls)),
+        tuple(sorted(control_paths)),
+        tuple(sorted(plugin_names)),
+        True,
+    )
+
+
+def _python_module_control_globs(module: str) -> tuple[str, ...]:
+    if _PYTHON_MODULE_NAME.fullmatch(module) is None:
+        return ()
+    top_level = module.split(".", 1)[0]
+    controls: set[str] = set()
+    controls.update(_workspace_candidate_globs(f"{top_level}.py"))
+    controls.update(_workspace_candidate_globs(f"{top_level}.pyc"))
+    controls.update(_workspace_candidate_globs(top_level))
+    controls.update(_workspace_candidate_globs(f"{top_level}/**"))
+    return tuple(sorted(controls))
+
+
+def _pytest_argv_controls(
+    arguments: tuple[str, ...],
+    *,
+    cwd: Path,
+    guard: WorkspaceGuard,
+) -> tuple[set[str], set[str]]:
+    control_paths: set[str] = set()
+    plugin_names: set[str] = set()
+    index = 0
+    while index < len(arguments):
+        argument = arguments[index]
+        config_value: str | None = None
+        plugin_value: str | None = None
+        if argument in {"-c", "--config-file"}:
+            if index + 1 >= len(arguments):
+                raise VerificationConfigError(
+                    f"pytest option {argument} requires a config path"
+                )
+            index += 1
+            config_value = arguments[index]
+        elif argument.startswith("--config-file="):
+            config_value = argument.split("=", 1)[1]
+        elif argument.startswith("-c") and not argument.startswith("--"):
+            config_value = argument[2:]
+        elif argument == "-p":
+            if index + 1 >= len(arguments):
+                raise VerificationConfigError("pytest option -p requires a plugin name")
+            index += 1
+            plugin_value = arguments[index]
+        elif argument.startswith("-p") and not argument.startswith("--"):
+            plugin_value = argument[2:]
+        else:
+            plugin_names.update(_pytest_plugin_names_from_text(argument))
+
+        if config_value is not None:
+            relative = _workspace_pytest_config_path(
+                config_value,
+                cwd=cwd,
+                guard=guard,
+            )
+            if relative is not None:
+                control_paths.add(relative)
+        if plugin_value is not None:
+            plugin_name = plugin_value.strip()
+            if (
+                plugin_name
+                and not plugin_name.startswith("no:")
+                and _PYTHON_MODULE_NAME.fullmatch(plugin_name) is not None
+            ):
+                plugin_names.add(plugin_name)
+        index += 1
+    return control_paths, plugin_names
+
+
+def _workspace_pytest_config_path(
+    value: str,
+    *,
+    cwd: Path,
+    guard: WorkspaceGuard,
+) -> str:
+    if not value:
+        raise VerificationConfigError("pytest config path must not be empty")
+    try:
+        candidate = Path(value)
+        resolved = (
+            candidate.resolve(strict=False)
+            if candidate.is_absolute()
+            else (cwd / candidate).resolve(strict=False)
+        )
+        relative = resolved.relative_to(guard.root).as_posix()
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise VerificationConfigError(
+            "pytest config path must stay inside the workspace"
+        ) from exc
+    if not relative or relative == ".":
+        raise VerificationConfigError("pytest config path must name a file")
+    if guard.path_uses_link(relative):
+        raise VerificationConfigError(
+            f"pytest config path must not use a symlink: {relative}"
+        )
+    return relative
+
+
+def _workspace_pytest_plugin_names(
+    guard: WorkspaceGuard,
+    *,
+    explicit_config_paths: set[str],
+) -> set[str]:
+    candidates: dict[str, Path] = {}
+    config_names = {name.casefold() for name in _PYTEST_CONTROL_FILES}
+    for path in _workspace_entries(guard.root):
+        relative = path.relative_to(guard.root).as_posix()
+        name = path.name.casefold()
+        if name in config_names or (
+            name == "entry_points.txt"
+            and path.parent.name.casefold().endswith((".dist-info", ".egg-info"))
+        ):
+            candidates[relative] = path
+    for relative in explicit_config_paths:
+        candidates[relative] = guard.lexical_path(relative)
+
+    plugin_names: set[str] = set()
+    for relative, path in sorted(candidates.items()):
+        text = _pytest_control_text(path, relative, guard.max_file_bytes)
+        if text is None:
+            continue
+        plugin_names.update(_pytest_plugin_names_from_text(text))
+        if path.name.casefold() == "conftest.py":
+            plugin_names.update(
+                _pytest_plugins_from_python_source(text, relative)
+            )
+        if "pytest11" in text.casefold():
+            plugin_names.update(_pytest_entrypoint_modules(text))
+    return plugin_names
+
+
+def _pytest_control_text(
+    path: Path,
+    relative: str,
+    max_bytes: int,
+) -> str | None:
+    if not path.exists():
+        return None
+    if is_link_like(path):
+        raise VerificationConfigError(
+            f"pytest control file must not use a symlink: {relative}"
+        )
+    if not path.is_file():
+        raise VerificationConfigError(f"pytest control path is not a file: {relative}")
+    try:
+        raw = path.read_bytes()
+    except OSError as exc:
+        raise VerificationConfigError(
+            f"pytest control file cannot be read: {relative}"
+        ) from exc
+    if len(raw) > max_bytes:
+        raise VerificationConfigError(
+            f"pytest control file exceeds {max_bytes} bytes: {relative}"
+        )
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise VerificationConfigError(
+            f"pytest control file must be UTF-8: {relative}"
+        ) from exc
+
+
+def _pytest_plugin_names_from_text(text: str) -> set[str]:
+    names: set[str] = set()
+    for match in _PYTEST_PLUGIN_OPTION.finditer(text):
+        name = match.group("name").strip()
+        if (
+            not name.startswith("no:")
+            and _PYTHON_MODULE_NAME.fullmatch(name) is not None
+        ):
+            names.add(name)
+    return names
+
+
+def _pytest_plugins_from_python_source(text: str, relative: str) -> set[str]:
+    if "pytest_plugins" not in text:
+        return set()
+    try:
+        tree = ast.parse(text)
+    except SyntaxError:
+        return set()
+
+    names: set[str] = set()
+    for node in ast.walk(tree):
+        value: ast.expr | None = None
+        targets: tuple[ast.expr, ...] = ()
+        if isinstance(node, ast.Assign):
+            value = node.value
+            targets = tuple(node.targets)
+        elif isinstance(node, ast.AnnAssign):
+            value = node.value
+            targets = (node.target,)
+        if value is None or not any(
+            isinstance(target, ast.Name) and target.id == "pytest_plugins"
+            for target in targets
+        ):
+            continue
+        try:
+            declared = ast.literal_eval(value)
+        except (ValueError, TypeError, SyntaxError) as exc:
+            raise VerificationConfigError(
+                f"pytest_plugins must be a literal string or sequence: {relative}"
+            ) from exc
+        values = (declared,) if isinstance(declared, str) else declared
+        if not isinstance(values, (list, tuple)) or any(
+            not isinstance(item, str) for item in values
+        ):
+            raise VerificationConfigError(
+                f"pytest_plugins must be a literal string or sequence: {relative}"
+            )
+        for item in values:
+            for name in item.split(","):
+                normalized = name.strip()
+                if _PYTHON_MODULE_NAME.fullmatch(normalized) is not None:
+                    names.add(normalized)
+    return names
+
+
+def _pytest_entrypoint_modules(text: str) -> set[str]:
+    names: set[str] = set()
+    in_pytest_group = False
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if line.startswith("[") and line.endswith("]"):
+            in_pytest_group = "pytest11" in line.casefold()
+            continue
+        if not in_pytest_group or not line or line.startswith(("#", ";")):
+            continue
+        if "=" not in line:
+            continue
+        value = line.split("=", 1)[1].strip().strip("\"'")
+        module = value.split(":", 1)[0].strip()
+        if _PYTHON_MODULE_NAME.fullmatch(module) is not None:
+            names.add(module)
+    return names
+
+
+def _workspace_candidate_globs(path: str) -> tuple[str, ...]:
+    patterns = [path, f"**/{path}"]
+    case_insensitive = "".join(
+        f"[{character.casefold()}{character.upper()}]"
+        if "a" <= character.casefold() <= "z"
+        else character
+        for character in path
+    )
+    patterns.extend((case_insensitive, f"**/{case_insensitive}"))
+    return tuple(patterns)
 
 
 def _workspace_entries(root: Path) -> tuple[Path, ...]:
@@ -692,7 +1069,7 @@ def _workspace_entries(root: Path) -> tuple[Path, ...]:
             for child in children:
                 path = Path(child.path)
                 link_like = is_link_like(path)
-                if child.name.casefold() in SKIPPED_DIRECTORIES and (
+                if child.name.casefold() in _MANIFEST_SKIPPED_DIRECTORIES and (
                     link_like or child.is_dir(follow_symlinks=False)
                 ):
                     continue

@@ -292,6 +292,77 @@ def test_adds_negative_numbers():
     assert artifact["changed_files"] == ["calculator.py"]
 
 
+def test_workspace_pytest_shadow_cannot_turn_red_verification_green(
+    tmp_path: Path,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    protected_test = tests_dir / "test_still_red.py"
+    protected_test.write_text(
+        "def test_still_red():\n    assert False\n",
+        encoding="utf-8",
+    )
+    protected_before = protected_test.read_bytes()
+    config = write_pytest_config(tmp_path, baseline_policy="must_fail")
+    config_before = config.read_bytes()
+    registry, gate, trace = production_runtime(
+        tmp_path,
+        run_id="e2e-pytest-shadow",
+    )
+    shadow_pytest = ToolCall(
+        id="shadow-pytest",
+        name="write_file",
+        arguments={
+            "path": "pytest.py",
+            "content": "raise SystemExit(0)\n",
+            "mode": "create",
+        },
+    )
+    completion = ToolCall(
+        id="complete-shadowed",
+        name="complete_task",
+        arguments={"summary": "tests pass"},
+    )
+    model = ScriptedModel(
+        [
+            tool_response(shadow_pytest),
+            tool_response(completion),
+        ]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        verification_gate=gate,
+        context_policy=ContextPolicy(),
+        trace_writer=trace,
+    ).run("Make the protected failing test pass")
+
+    assert result.state is AgentState.VERIFICATION_FAILED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.VERIFICATION_FAILED
+    assert result.baseline_verification is not None
+    assert result.baseline_verification.passed is True
+    assert result.baseline_verification.commands[0].exit_code not in (None, 0)
+    assert result.final_verification is not None
+    assert result.final_verification.passed is False
+    assert result.final_verification.commands[0].exit_code not in (None, 0)
+    assert result.verified_seq is None
+    assert result.mutation_seq == 0
+    assert not (tmp_path / "pytest.py").exists()
+    assert protected_test.read_bytes() == protected_before
+    assert config.read_bytes() == config_before
+    shadow_result = next(
+        message.tool_result
+        for message in result.history
+        if message.role is Role.TOOL
+        and message.tool_result is not None
+        and message.tool_result.call_id == "shadow-pytest"
+    )
+    assert shadow_result.ok is False
+    assert shadow_result.error_kind is ErrorKind.PATH_WRITE_DENIED
+
+
 def test_failed_verification_evidence_drives_repair_to_verified(
     tmp_path: Path,
 ) -> None:
