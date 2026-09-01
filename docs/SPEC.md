@@ -53,8 +53,11 @@ dataclasses and tuples containing baseline_policy, ordered tuple-argv commands
 with normalized cwd and bounded timeout, repair/stall limits, normalized
 user-declared protected_globs plus command-derived Python verifier-control
 globs, and the config path. The derived globs cover workspace candidates that
-could redirect configured Python module/startup resolution; pytest commands
-also derive configuration, conftest, and plugin-discovery control candidates.
+could redirect configured Python module/startup resolution, including frozen
+workspace `PYTHONPATH` and effective interpreter/site controls. Pytest commands
+also derive configuration, conftest, explicit/discovered plugin targets, and
+plugin-discovery control candidates. Unsafe dynamic workspace startup/plugin
+declarations fail configuration closed when their targets cannot be frozen.
 
 A representative configuration has a verification table with baseline_policy,
 max_repair_rounds, max_same_failure, protected_globs, and an array of command
@@ -85,10 +88,11 @@ summary when those evidence outputs are available.
 ## Protected manifest
 
 VerificationGate builds its initial manifest before baseline/model execution.
-Both user-declared and command-derived globs feed the same frozen boundary. It
-records deterministic workspace-relative matched entries with existence, kind,
-size, and SHA-256 where applicable, and includes the config path even when
-absent. Link-like entries are recorded without following them.
+Both user-declared and command-derived globs and exact control paths feed the
+same frozen boundary. It records deterministic workspace-relative matched
+entries with existence, kind, size, and SHA-256 where applicable, and includes
+the config path even when absent. Link-like entries are recorded without
+following them.
 
 Final verification compares the original manifest before and after its commands,
 detecting created, deleted, modified, and type-replaced entries. A newly created
@@ -96,9 +100,9 @@ file matching an initially absent verifier-control candidate is therefore also
 detected. Evidence has paths and change kinds, not contents. Any change produces
 PROTECTED_FILE_CHANGED, even if commands exit zero.
 
-protected_guard_for_spec adds the effective globs and exact config path to
-file-tool write denies. This blocks edit/create/overwrite but is not an OS
-sandbox: repository code launched by run_command may still mutate protected
+protected_guard_for_spec adds the effective globs and exact verifier/config
+paths to file-tool write denies. This blocks edit/create/overwrite but is not an
+OS sandbox: repository code launched by run_command may still mutate protected
 paths, so the final manifest check remains mandatory.
 
 ## Freshness and final Gate invariants

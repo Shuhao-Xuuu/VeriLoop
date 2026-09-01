@@ -6,10 +6,14 @@ import ast
 from dataclasses import dataclass
 from enum import Enum
 import hashlib
+import importlib.machinery
+import importlib.metadata
 import json
 import os
 from pathlib import Path
 import re
+import shlex
+import site
 import stat
 import sys
 import tempfile
@@ -17,7 +21,6 @@ import tomllib
 from typing import Any, Sequence
 
 from .filesystem import (
-    SKIPPED_DIRECTORIES,
     WorkspaceGuard,
     is_link_like,
     matches_workspace_glob,
@@ -40,9 +43,9 @@ DEFAULT_CONFIG_PATH = ".veriloop.toml"
 DEFAULT_MAX_REPAIR_ROUNDS = 2
 DEFAULT_MAX_SAME_FAILURE = 2
 
-_PYTHON_STARTUP_CONTROL_FILES = (
-    "sitecustomize.py",
-    "usercustomize.py",
+_PYTHON_STARTUP_CONTROL_MODULES = (
+    "sitecustomize",
+    "usercustomize",
 )
 _PYTEST_CONTROL_FILES = (
     "conftest.py",
@@ -69,14 +72,8 @@ _MANIFEST_SKIPPED_DIRECTORIES = frozenset(
     }
 )
 _PYTHON_MODULE_NAME = re.compile(
-    r"[A-Za-z_][A-Za-z0-9_]*(?:\.[A-Za-z_][A-Za-z0-9_]*)*\Z"
+    r"[A-Za-z0-9_-]+(?:\.[A-Za-z0-9_-]+)*\Z"
 )
-_PYTEST_PLUGIN_OPTION = re.compile(
-    r"(?<![A-Za-z0-9_-])-p(?:[\s\"',\[\]]*)"
-    r"(?P<name>(?:no:)?[A-Za-z_][A-Za-z0-9_.-]*)"
-)
-
-
 class BaselinePolicy(str, Enum):
     MUST_FAIL = "must_fail"
     RECORD_ONLY = "record_only"
@@ -674,7 +671,16 @@ def _commands(
     verifier_control_globs: set[str] = set()
     verifier_control_paths: set[str] = set()
     pytest_plugin_names: set[str] = set()
+    pytest_config_paths: set[str] = set()
     has_pytest_command = False
+    python_path = next(
+        (
+            value
+            for name, value in runner.child_environment.items()
+            if name.casefold() == "pythonpath"
+        ),
+        None,
+    )
     for index, item in enumerate(value):
         if not isinstance(item, dict):
             raise VerificationConfigError(
@@ -743,23 +749,26 @@ def _commands(
                 timeout_seconds=timeout,
             )
         )
-        control_globs, control_paths, plugin_names, is_pytest = (
+        control_globs, control_paths, plugin_names, config_paths, is_pytest = (
             _python_verifier_controls(
                 validated_argv,
                 cwd=cwd_path,
                 guard=guard,
+                python_path=python_path,
             )
         )
         verifier_control_globs.update(control_globs)
         verifier_control_paths.update(control_paths)
         pytest_plugin_names.update(plugin_names)
+        pytest_config_paths.update(config_paths)
         has_pytest_command = has_pytest_command or is_pytest
 
     if has_pytest_command:
+        pytest_plugin_names.update(_installed_pytest_plugin_names())
         pytest_plugin_names.update(
             _workspace_pytest_plugin_names(
                 guard,
-                explicit_config_paths=verifier_control_paths,
+                explicit_config_paths=pytest_config_paths,
             )
         )
         for plugin_name in pytest_plugin_names:
@@ -779,38 +788,402 @@ def _python_verifier_controls(
     *,
     cwd: Path,
     guard: WorkspaceGuard,
-) -> tuple[tuple[str, ...], tuple[str, ...], tuple[str, ...], bool]:
+    python_path: str | None,
+) -> tuple[
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    tuple[str, ...],
+    bool,
+]:
     if not argv or argv[0] != sys.executable:
-        return (), (), (), False
+        return (), (), (), (), False
 
-    controls: set[str] = set()
-    for name in _PYTHON_STARTUP_CONTROL_FILES:
-        controls.update(_workspace_candidate_globs(name))
+    startup_globs, startup_paths = _workspace_python_startup_controls(
+        guard,
+        cwd=cwd,
+        python_path=python_path,
+    )
+    controls = set(startup_globs)
+    for module_name in _PYTHON_STARTUP_CONTROL_MODULES:
+        controls.update(_python_module_control_globs(module_name))
+    controls.update(_workspace_python_startup_hook_controls(guard))
 
     if len(argv) < 3 or argv[1] != "-m":
-        return tuple(sorted(controls)), (), (), False
+        return tuple(sorted(controls)), startup_paths, (), (), False
 
     module = argv[2]
     controls.update(_python_module_control_globs(module))
 
     if module.casefold() != "pytest":
-        return tuple(sorted(controls)), (), (), False
+        return tuple(sorted(controls)), startup_paths, (), (), False
 
     for name in _PYTEST_CONTROL_FILES:
         controls.update(_workspace_candidate_globs(name))
     for name in _PYTEST_PLUGIN_METADATA_FILES:
         controls.update(_workspace_candidate_globs(name))
-    control_paths, plugin_names = _pytest_argv_controls(
+    config_paths, plugin_names = _pytest_argv_controls(
         argv[3:],
         cwd=cwd,
         guard=guard,
     )
+    control_paths = set(config_paths)
+    control_paths.update(startup_paths)
     return (
         tuple(sorted(controls)),
         tuple(sorted(control_paths)),
         tuple(sorted(plugin_names)),
+        tuple(sorted(config_paths)),
         True,
     )
+
+
+def _workspace_python_startup_controls(
+    guard: WorkspaceGuard,
+    *,
+    cwd: Path,
+    python_path: str | None,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    try:
+        site_directories = list(site.getsitepackages())
+        user_site = site.getusersitepackages()
+    except (AttributeError, OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise VerificationConfigError(
+            "Python startup paths cannot be enumerated"
+        ) from exc
+    if isinstance(user_site, str):
+        site_directories.append(user_site)
+    else:
+        site_directories.extend(user_site)
+
+    controls: set[str] = set()
+    paths = _workspace_pythonpath_control_paths(
+        python_path,
+        cwd=cwd,
+        guard=guard,
+    )
+    for directory in site_directories:
+        relative = _workspace_runtime_control_path(
+            directory,
+            guard=guard,
+            description="Python site directory",
+        )
+        if relative is None:
+            continue
+        if relative != ".":
+            paths.add(relative)
+            pth_pattern = f"{relative}/*.pth"
+        else:
+            pth_pattern = "*.pth"
+        controls.add(pth_pattern)
+        controls.add(_case_insensitive_glob(pth_pattern))
+        pth_controls, pth_paths = _workspace_pth_controls(
+            guard.lexical_path(relative),
+            relative=relative,
+            guard=guard,
+        )
+        controls.update(pth_controls)
+        paths.update(pth_paths)
+
+    executable = Path(sys.executable)
+    startup_candidates = (
+        executable,
+        executable.with_suffix("._pth"),
+        executable.parent
+        / f"python{sys.version_info.major}{sys.version_info.minor}._pth",
+        executable.parent / "pyvenv.cfg",
+        executable.parent.parent / "pyvenv.cfg",
+    )
+    for candidate in startup_candidates:
+        relative = _workspace_runtime_control_path(
+            candidate,
+            guard=guard,
+            description="Python interpreter startup control",
+        )
+        if relative not in (None, "."):
+            paths.add(relative)
+            if candidate.name.casefold().endswith("._pth"):
+                paths.update(
+                    _workspace_isolated_python_path_controls(
+                        candidate,
+                        relative=relative,
+                        guard=guard,
+                    )
+                )
+    return tuple(sorted(controls)), tuple(sorted(paths))
+
+
+def _workspace_pythonpath_control_paths(
+    python_path: str | None,
+    *,
+    cwd: Path,
+    guard: WorkspaceGuard,
+) -> set[str]:
+    paths: set[str] = set()
+    if python_path is None:
+        return paths
+    for raw_entry in python_path.split(os.pathsep):
+        candidate = cwd if not raw_entry else Path(raw_entry)
+        if not candidate.is_absolute():
+            candidate = cwd / candidate
+        relative = _workspace_runtime_control_path(
+            candidate,
+            guard=guard,
+            description="PYTHONPATH entry",
+        )
+        if relative not in (None, "."):
+            paths.add(relative)
+    return paths
+
+
+def _workspace_isolated_python_path_controls(
+    path: Path,
+    *,
+    relative: str,
+    guard: WorkspaceGuard,
+) -> set[str]:
+    text = _control_text(
+        path,
+        relative,
+        guard.max_file_bytes,
+        description="Python ._pth file",
+    )
+    if text is None:
+        return set()
+    paths: set[str] = set()
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        if not line or line.startswith("#") or line == "import site":
+            continue
+        if line.startswith(("import ", "import\t")):
+            raise VerificationConfigError(
+                f"Python ._pth executable line is not supported: {relative}"
+            )
+        candidate = Path(line)
+        if not candidate.is_absolute():
+            candidate = path.parent / candidate
+        target = _workspace_runtime_control_path(
+            candidate,
+            guard=guard,
+            description="Python ._pth path entry",
+        )
+        if target not in (None, "."):
+            paths.add(target)
+    return paths
+
+
+def _workspace_python_startup_hook_controls(
+    guard: WorkspaceGuard,
+) -> set[str]:
+    modules = {name.casefold() for name in _PYTHON_STARTUP_CONTROL_MODULES}
+    source_names = {f"{name}.py" for name in modules}
+    compiled_names = {
+        f"{name}{suffix}".casefold()
+        for name in modules
+        for suffix in importlib.machinery.all_suffixes()
+        if suffix != ".py"
+    }
+    package_compiled_names = {
+        f"__init__{suffix}".casefold()
+        for suffix in importlib.machinery.all_suffixes()
+        if suffix != ".py"
+    }
+
+    controls: set[str] = set()
+    for path in _workspace_entries(guard.root):
+        name = path.name.casefold()
+        parent_name = path.parent.name.casefold()
+        is_source = name in source_names or (
+            name == "__init__.py" and parent_name in modules
+        )
+        is_compiled = name in compiled_names or (
+            name in package_compiled_names and parent_name in modules
+        )
+        if not is_source and not is_compiled:
+            continue
+        relative = path.relative_to(guard.root).as_posix()
+        if is_compiled:
+            raise VerificationConfigError(
+                f"compiled Python startup hook cannot be inspected safely: {relative}"
+            )
+        text = _control_text(
+            path,
+            relative,
+            guard.max_file_bytes,
+            description="Python startup hook",
+        )
+        if text is None:
+            continue
+        for module_name in _static_python_control_modules(
+            text,
+            relative=relative,
+            description="Python startup hook",
+            allow_docstring=True,
+        ):
+            controls.update(_python_module_control_globs(module_name))
+    return controls
+
+
+def _workspace_pth_controls(
+    site_directory: Path,
+    *,
+    relative: str,
+    guard: WorkspaceGuard,
+) -> tuple[set[str], set[str]]:
+    if not site_directory.exists():
+        return set(), set()
+    if not site_directory.is_dir():
+        raise VerificationConfigError(
+            f"Python site path is not a directory: {relative}"
+        )
+    try:
+        pth_files = sorted(
+            path
+            for path in site_directory.iterdir()
+            if path.name.casefold().endswith(".pth")
+        )
+    except OSError as exc:
+        raise VerificationConfigError(
+            f"Python site directory cannot be read: {relative}"
+        ) from exc
+
+    controls: set[str] = set()
+    paths: set[str] = set()
+    for path in pth_files:
+        pth_relative = guard.relative_lexical(path)
+        text = _control_text(
+            path,
+            pth_relative,
+            guard.max_file_bytes,
+            description="Python .pth file",
+        )
+        if text is None:
+            continue
+        for raw_line in text.splitlines():
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith(("import ", "import\t")):
+                for module_name in _python_pth_import_modules(line, pth_relative):
+                    controls.update(_python_module_control_globs(module_name))
+                continue
+            candidate = Path(line)
+            if not candidate.is_absolute():
+                candidate = site_directory / candidate
+            target = _workspace_runtime_control_path(
+                candidate,
+                guard=guard,
+                description="Python .pth path entry",
+            )
+            if target not in (None, "."):
+                paths.add(target)
+    return controls, paths
+
+
+def _python_pth_import_modules(line: str, relative: str) -> set[str]:
+    return _static_python_control_modules(
+        line,
+        relative=relative,
+        description="Python executable .pth line",
+        allow_docstring=False,
+    )
+
+
+def _static_python_control_modules(
+    text: str,
+    *,
+    relative: str,
+    description: str,
+    allow_docstring: bool,
+) -> set[str]:
+    try:
+        tree = ast.parse(text)
+    except SyntaxError as exc:
+        raise VerificationConfigError(
+            f"{description} cannot be parsed safely: {relative}"
+        ) from exc
+    modules: set[str] = set()
+    bound_names: set[str] = set()
+    for statement in tree.body:
+        if (
+            allow_docstring
+            and isinstance(statement, ast.Expr)
+            and isinstance(statement.value, ast.Constant)
+            and isinstance(statement.value.value, str)
+        ):
+            continue
+        if isinstance(statement, ast.Pass):
+            continue
+        if isinstance(statement, ast.Import):
+            for alias in statement.names:
+                if _PYTHON_MODULE_NAME.fullmatch(alias.name) is None:
+                    raise VerificationConfigError(
+                        f"{description} import cannot be protected: {relative}"
+                    )
+                modules.add(alias.name)
+                bound_names.add(alias.asname or alias.name.split(".", 1)[0])
+            continue
+        if isinstance(statement, ast.ImportFrom):
+            if (
+                statement.level
+                or statement.module is None
+                or _PYTHON_MODULE_NAME.fullmatch(statement.module) is None
+            ):
+                raise VerificationConfigError(
+                    f"{description} import cannot be protected: {relative}"
+                )
+            modules.add(statement.module)
+            bound_names.update(
+                alias.asname or alias.name for alias in statement.names
+            )
+            continue
+        if isinstance(statement, ast.Expr) and isinstance(statement.value, ast.Call):
+            call = statement.value
+            root = call.func
+            while isinstance(root, ast.Attribute):
+                root = root.value
+            if (
+                call.args
+                or call.keywords
+                or not isinstance(root, ast.Name)
+                or root.id not in bound_names
+            ):
+                raise VerificationConfigError(
+                    f"{description} is not statically safe: {relative}"
+                )
+            continue
+        raise VerificationConfigError(
+            f"{description} is not statically safe: {relative}"
+        )
+    if not modules and not allow_docstring:
+        raise VerificationConfigError(
+            f"{description} has no protected import: {relative}"
+        )
+    return modules
+
+
+def _workspace_runtime_control_path(
+    value: str | os.PathLike[str],
+    *,
+    guard: WorkspaceGuard,
+    description: str,
+) -> str | None:
+    try:
+        candidate = Path(os.path.abspath(value))
+        relative = guard.relative_lexical(candidate)
+    except (OSError, TypeError, ValueError, ToolExecutionError):
+        return None
+    try:
+        uses_link = guard.path_uses_link(relative)
+    except ToolExecutionError as exc:
+        raise VerificationConfigError(
+            f"{description} must stay inside the workspace: {relative}"
+        ) from exc
+    if uses_link:
+        raise VerificationConfigError(
+            f"{description} must not use a symlink: {relative}"
+        )
+    return relative
 
 
 def _python_module_control_globs(module: str) -> tuple[str, ...]:
@@ -818,8 +1191,8 @@ def _python_module_control_globs(module: str) -> tuple[str, ...]:
         return ()
     top_level = module.split(".", 1)[0]
     controls: set[str] = set()
-    controls.update(_workspace_candidate_globs(f"{top_level}.py"))
-    controls.update(_workspace_candidate_globs(f"{top_level}.pyc"))
+    for suffix in importlib.machinery.all_suffixes():
+        controls.update(_workspace_candidate_globs(f"{top_level}{suffix}"))
     controls.update(_workspace_candidate_globs(top_level))
     controls.update(_workspace_candidate_globs(f"{top_level}/**"))
     return tuple(sorted(controls))
@@ -869,11 +1242,15 @@ def _pytest_argv_controls(
                 control_paths.add(relative)
         if plugin_value is not None:
             plugin_name = plugin_value.strip()
-            if (
-                plugin_name
-                and not plugin_name.startswith("no:")
-                and _PYTHON_MODULE_NAME.fullmatch(plugin_name) is not None
-            ):
+            if not plugin_name:
+                raise VerificationConfigError(
+                    "pytest option -p requires a plugin name"
+                )
+            if not plugin_name.startswith("no:"):
+                if _PYTHON_MODULE_NAME.fullmatch(plugin_name) is None:
+                    raise VerificationConfigError(
+                        "pytest plugin module name cannot be protected safely"
+                    )
                 plugin_names.add(plugin_name)
         index += 1
     return control_paths, plugin_names
@@ -889,22 +1266,28 @@ def _workspace_pytest_config_path(
         raise VerificationConfigError("pytest config path must not be empty")
     try:
         candidate = Path(value)
+        lexical = Path(
+            os.path.abspath(candidate if candidate.is_absolute() else cwd / candidate)
+        )
+        lexical_relative = guard.relative_lexical(lexical)
+        if guard.path_uses_link(lexical_relative):
+            raise VerificationConfigError(
+                f"pytest config path must not use a symlink: {lexical_relative}"
+            )
         resolved = (
             candidate.resolve(strict=False)
             if candidate.is_absolute()
             else (cwd / candidate).resolve(strict=False)
         )
         relative = resolved.relative_to(guard.root).as_posix()
-    except (OSError, RuntimeError, ValueError) as exc:
+    except VerificationConfigError:
+        raise
+    except (OSError, RuntimeError, ValueError, ToolExecutionError) as exc:
         raise VerificationConfigError(
             "pytest config path must stay inside the workspace"
         ) from exc
     if not relative or relative == ".":
         raise VerificationConfigError("pytest config path must name a file")
-    if guard.path_uses_link(relative):
-        raise VerificationConfigError(
-            f"pytest config path must not use a symlink: {relative}"
-        )
     return relative
 
 
@@ -941,46 +1324,118 @@ def _workspace_pytest_plugin_names(
     return plugin_names
 
 
+def _installed_pytest_plugin_names() -> set[str]:
+    try:
+        entrypoints = importlib.metadata.entry_points(group="pytest11")
+    except Exception as exc:
+        raise VerificationConfigError(
+            "installed pytest plugin entry points cannot be enumerated"
+        ) from exc
+
+    names: set[str] = set()
+    for entrypoint in entrypoints:
+        value = getattr(entrypoint, "value", None)
+        module = _pytest_entrypoint_module(value) if isinstance(value, str) else None
+        if module is None:
+            raise VerificationConfigError(
+                "installed pytest plugin entry point has an unsafe target"
+            )
+        names.add(module)
+    return names
+
+
 def _pytest_control_text(
     path: Path,
     relative: str,
     max_bytes: int,
 ) -> str | None:
+    return _control_text(
+        path,
+        relative,
+        max_bytes,
+        description="pytest control file",
+    )
+
+
+def _control_text(
+    path: Path,
+    relative: str,
+    max_bytes: int,
+    *,
+    description: str,
+) -> str | None:
     if not path.exists():
         return None
     if is_link_like(path):
         raise VerificationConfigError(
-            f"pytest control file must not use a symlink: {relative}"
+            f"{description} must not use a symlink: {relative}"
         )
     if not path.is_file():
-        raise VerificationConfigError(f"pytest control path is not a file: {relative}")
+        raise VerificationConfigError(f"{description} is not a file: {relative}")
     try:
         raw = path.read_bytes()
     except OSError as exc:
         raise VerificationConfigError(
-            f"pytest control file cannot be read: {relative}"
+            f"{description} cannot be read: {relative}"
         ) from exc
     if len(raw) > max_bytes:
         raise VerificationConfigError(
-            f"pytest control file exceeds {max_bytes} bytes: {relative}"
+            f"{description} exceeds {max_bytes} bytes: {relative}"
         )
     try:
         return raw.decode("utf-8")
     except UnicodeDecodeError as exc:
         raise VerificationConfigError(
-            f"pytest control file must be UTF-8: {relative}"
+            f"{description} must be UTF-8: {relative}"
         ) from exc
 
 
 def _pytest_plugin_names_from_text(text: str) -> set[str]:
+    if "-p" not in text:
+        return set()
+    try:
+        lexer = shlex.shlex(text, posix=True, punctuation_chars="[]=,")
+        lexer.whitespace_split = True
+        lexer.commenters = "#;"
+        raw_tokens = list(lexer)
+    except ValueError as exc:
+        raise VerificationConfigError(
+            "pytest plugin options cannot be parsed safely"
+        ) from exc
+    tokens = [
+        token
+        for token in raw_tokens
+        if token and not all(character in "[]=," for character in token)
+    ]
+
     names: set[str] = set()
-    for match in _PYTEST_PLUGIN_OPTION.finditer(text):
-        name = match.group("name").strip()
-        if (
-            not name.startswith("no:")
-            and _PYTHON_MODULE_NAME.fullmatch(name) is not None
-        ):
-            names.add(name)
+    index = 0
+    while index < len(tokens):
+        token = tokens[index]
+        name: str | None = None
+        if token == "-p":
+            if index + 1 >= len(tokens):
+                raise VerificationConfigError(
+                    "pytest option -p requires a plugin name"
+                )
+            index += 1
+            name = tokens[index].strip()
+        elif token.startswith("-p") and not token.startswith("--"):
+            name = token[2:].strip()
+        if name is None:
+            index += 1
+            continue
+        if not name:
+            raise VerificationConfigError("pytest option -p requires a plugin name")
+        if name.startswith("no:"):
+            index += 1
+            continue
+        if _PYTHON_MODULE_NAME.fullmatch(name) is None:
+            raise VerificationConfigError(
+                "pytest plugin module name cannot be protected safely"
+            )
+        names.add(name)
+        index += 1
     return names
 
 
@@ -989,10 +1444,13 @@ def _pytest_plugins_from_python_source(text: str, relative: str) -> set[str]:
         return set()
     try:
         tree = ast.parse(text)
-    except SyntaxError:
-        return set()
+    except SyntaxError as exc:
+        raise VerificationConfigError(
+            f"conftest.py cannot be parsed safely: {relative}"
+        ) from exc
 
     names: set[str] = set()
+    allowed_targets: set[int] = set()
     for node in ast.walk(tree):
         value: ast.expr | None = None
         targets: tuple[ast.expr, ...] = ()
@@ -1007,6 +1465,11 @@ def _pytest_plugins_from_python_source(text: str, relative: str) -> set[str]:
             for target in targets
         ):
             continue
+        allowed_targets.update(
+            id(target)
+            for target in targets
+            if isinstance(target, ast.Name) and target.id == "pytest_plugins"
+        )
         try:
             declared = ast.literal_eval(value)
         except (ValueError, TypeError, SyntaxError) as exc:
@@ -1023,8 +1486,26 @@ def _pytest_plugins_from_python_source(text: str, relative: str) -> set[str]:
         for item in values:
             for name in item.split(","):
                 normalized = name.strip()
-                if _PYTHON_MODULE_NAME.fullmatch(normalized) is not None:
-                    names.add(normalized)
+                if _PYTHON_MODULE_NAME.fullmatch(normalized) is None:
+                    raise VerificationConfigError(
+                        f"pytest plugin module name cannot be protected: {relative}"
+                    )
+                names.add(normalized)
+    if any(
+        (
+            isinstance(node, ast.Name)
+            and node.id == "pytest_plugins"
+            and id(node) not in allowed_targets
+        )
+        or (
+            isinstance(node, ast.Constant)
+            and node.value == "pytest_plugins"
+        )
+        for node in ast.walk(tree)
+    ):
+        raise VerificationConfigError(
+            f"pytest_plugins must use a literal assignment: {relative}"
+        )
     return names
 
 
@@ -1040,23 +1521,39 @@ def _pytest_entrypoint_modules(text: str) -> set[str]:
             continue
         if "=" not in line:
             continue
-        value = line.split("=", 1)[1].strip().strip("\"'")
-        module = value.split(":", 1)[0].strip()
-        if _PYTHON_MODULE_NAME.fullmatch(module) is not None:
-            names.add(module)
+        value = line.split("=", 1)[1]
+        module = _pytest_entrypoint_module(value)
+        if module is None:
+            raise VerificationConfigError(
+                "workspace pytest plugin entry point has an unsafe target"
+            )
+        names.add(module)
     return names
+
+
+def _pytest_entrypoint_module(value: str) -> str | None:
+    normalized = value.strip().strip("\"'")
+    target = normalized.split("[", 1)[0].strip()
+    module = target.split(":", 1)[0].strip()
+    if _PYTHON_MODULE_NAME.fullmatch(module) is None:
+        return None
+    return module
 
 
 def _workspace_candidate_globs(path: str) -> tuple[str, ...]:
     patterns = [path, f"**/{path}"]
-    case_insensitive = "".join(
+    case_insensitive = _case_insensitive_glob(path)
+    patterns.extend((case_insensitive, f"**/{case_insensitive}"))
+    return tuple(patterns)
+
+
+def _case_insensitive_glob(path: str) -> str:
+    return "".join(
         f"[{character.casefold()}{character.upper()}]"
         if "a" <= character.casefold() <= "z"
         else character
         for character in path
     )
-    patterns.extend((case_insensitive, f"**/{case_insensitive}"))
-    return tuple(patterns)
 
 
 def _workspace_entries(root: Path) -> tuple[Path, ...]:

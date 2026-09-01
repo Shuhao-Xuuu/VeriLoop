@@ -2,8 +2,11 @@ from __future__ import annotations
 
 from dataclasses import FrozenInstanceError, replace
 import hashlib
+import importlib.metadata
 import json
+import os
 from pathlib import Path
+import site
 
 import pytest
 
@@ -227,6 +230,7 @@ argv = ["python", "-m", "pytest", "-q"]
         "pytest.py",
         "PyTeSt.py",
         "sitecustomize.py",
+        "src/sitecustomize/__init__.py",
         "nested/usercustomize.py",
         "conftest.py",
         "pytest.ini",
@@ -237,7 +241,7 @@ def test_python_pytest_verifier_controls_are_implicitly_write_protected(
     tmp_path: Path,
     relative_path: str,
 ) -> None:
-    (tmp_path / "nested").mkdir()
+    (tmp_path / relative_path).parent.mkdir(parents=True, exist_ok=True)
     registry, _ = verification_stack(
         tmp_path,
         """
@@ -288,6 +292,188 @@ argv = ["python", "-m", "pytest", "-q"]
     assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
     assert result.verified_seq is None
     assert verification_gate.grants_verified(result, mutation_seq=1) is False
+
+
+def test_gate_manifests_workspace_python_site_pth_creation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site_packages = tmp_path / ".venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_packages)])
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+    startup_control = site_packages / "force_green.pth"
+    startup_control.write_text(
+        "import os; os.environ['PYTEST_ADDOPTS'] = '-p force_green'\n",
+        encoding="utf-8",
+    )
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    relative = startup_control.relative_to(tmp_path).as_posix()
+    assert result.passed is False
+    assert result.protected_changes == (
+        ProtectedFileChange(relative, ProtectedChangeKind.CREATED),
+    )
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=1) is False
+
+
+def test_gate_manifests_workspace_pythonpath_archive_creation(
+    tmp_path: Path,
+) -> None:
+    archive = tmp_path / "mutable-runtime.zip"
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(
+        guard,
+        CommandPolicy(),
+        child_environment={"PYTHONPATH": str(archive)},
+    )
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+    spec = load_verification_spec(guard, runner)
+    verification_gate = VerificationGate(spec, runner)
+    archive.write_bytes(b"not-a-zip-yet")
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.passed is False
+    assert result.protected_changes == (
+        ProtectedFileChange("mutable-runtime.zip", ProtectedChangeKind.CREATED),
+    )
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=1) is False
+
+
+def test_workspace_python_pth_import_target_is_implicitly_write_protected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site_packages = tmp_path / ".venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "existing_control.pth").write_text(
+        "import force_startup\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_packages)])
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "force_startup.py",
+            "content": "startup = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "force_startup.py").exists()
+
+
+def test_workspace_sitecustomize_import_target_is_implicitly_write_protected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sitecustomize.py").write_text(
+        "import force_startup\n",
+        encoding="utf-8",
+    )
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "force_startup.py",
+            "content": "startup = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "force_startup.py").exists()
+
+
+def test_workspace_sitecustomize_dynamic_code_is_rejected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "sitecustomize.py").write_text(
+        "import os\nos.environ['PYTEST_ADDOPTS'] = '-p force_green'\n",
+        encoding="utf-8",
+    )
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    with pytest.raises(VerificationConfigError, match="startup hook"):
+        load(tmp_path)
+
+
+def test_workspace_python_pth_dynamic_code_is_rejected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    site_packages = tmp_path / ".venv" / "Lib" / "site-packages"
+    site_packages.mkdir(parents=True)
+    (site_packages / "dynamic_control.pth").write_text(
+        "import os; os.environ['PYTEST_ADDOPTS'] = '-p force_green'\n",
+        encoding="utf-8",
+    )
+    monkeypatch.setattr(site, "getsitepackages", lambda: [str(site_packages)])
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    with pytest.raises(VerificationConfigError, match="executable .pth line"):
+        load(tmp_path)
 
 
 @pytest.mark.parametrize(
@@ -355,6 +541,28 @@ def test_explicit_pytest_config_outside_workspace_is_rejected(
         load(tmp_path)
 
 
+def test_explicit_pytest_config_symlink_is_rejected(tmp_path: Path) -> None:
+    target = tmp_path / "actual.ini"
+    target.write_text("[pytest]\n", encoding="utf-8")
+    alias = tmp_path / "active.ini"
+    try:
+        os.symlink(target, alias)
+    except OSError as exc:
+        pytest.skip(f"symlink creation unavailable on this host: {exc}")
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-c", "active.ini"]
+""",
+    )
+
+    with pytest.raises(VerificationConfigError, match="must not use a symlink"):
+        load(tmp_path)
+
+
 @pytest.mark.parametrize(
     "plugin_arguments",
     [
@@ -384,7 +592,113 @@ def test_explicit_pytest_plugin_module_is_implicitly_write_protected(
         "write_file",
         {
             "path": "verifier_plugin.py",
-            "content": "def pytest_sessionfinish(session):\n    session.exitstatus = 0\n",
+            "content": (
+                "def pytest_sessionfinish(session):\n"
+                "    session.exitstatus = 0\n"
+            ),
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+@pytest.mark.parametrize("plugin_name", ["verifier-plugin", "123verifier"])
+def test_non_identifier_pytest_plugin_module_is_implicitly_write_protected(
+    tmp_path: Path,
+    plugin_name: str,
+) -> None:
+    registry, _ = verification_stack(
+        tmp_path,
+        f"""
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q", "-p", "{plugin_name}"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": f"{plugin_name}.py",
+            "content": "plugin = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / f"{plugin_name}.py").exists()
+
+
+def test_pytest_entrypoint_with_extras_protects_plugin_module(
+    tmp_path: Path,
+) -> None:
+    metadata_dir = tmp_path / "example.dist-info"
+    metadata_dir.mkdir()
+    (metadata_dir / "entry_points.txt").write_text(
+        "[pytest11]\nexample = verifier_plugin [test]\n",
+        encoding="utf-8",
+    )
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "verifier_plugin.py",
+            "content": "plugin = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+def test_installed_pytest_entrypoint_target_is_implicitly_write_protected(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    entrypoint = importlib.metadata.EntryPoint(
+        name="example",
+        value="verifier_plugin",
+        group="pytest11",
+    )
+    monkeypatch.setattr(
+        importlib.metadata,
+        "entry_points",
+        lambda **kwargs: (entrypoint,) if kwargs == {"group": "pytest11"} else (),
+    )
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "verifier_plugin.py",
+            "content": "plugin = True\n",
             "mode": "create",
         },
     )
@@ -416,7 +730,10 @@ argv = ["python", "-m", "pytest", "-q"]
         "write_file",
         {
             "path": "verifier_plugin.py",
-            "content": "def pytest_sessionfinish(session):\n    session.exitstatus = 0\n",
+            "content": (
+                "def pytest_sessionfinish(session):\n"
+                "    session.exitstatus = 0\n"
+            ),
             "mode": "create",
         },
     )
@@ -424,6 +741,120 @@ argv = ["python", "-m", "pytest", "-q"]
     assert result.ok is False
     assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
     assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+def test_quoted_unsafe_pytest_config_plugin_name_is_rejected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "pytest.ini").write_text(
+        '[pytest]\naddopts = -p "evil plugin"\n',
+        encoding="utf-8",
+    )
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    with pytest.raises(VerificationConfigError, match="cannot be protected safely"):
+        load(tmp_path)
+
+
+def test_conftest_declared_plugin_is_implicitly_write_protected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "conftest.py").write_text(
+        'pytest_plugins = ["verifier_plugin"]\n',
+        encoding="utf-8",
+    )
+    registry, _ = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    result = execute_file_tool(
+        registry,
+        "write_file",
+        {
+            "path": "verifier_plugin.py",
+            "content": "plugin = True\n",
+            "mode": "create",
+        },
+    )
+
+    assert result.ok is False
+    assert result.error_kind is ErrorKind.PATH_WRITE_DENIED
+    assert not (tmp_path / "verifier_plugin.py").exists()
+
+
+def test_dynamic_conftest_pytest_plugins_declaration_is_rejected(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "conftest.py").write_text(
+        'pytest_plugins = []\npytest_plugins += ["verifier_plugin"]\n',
+        encoding="utf-8",
+    )
+    write_config(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q"]
+""",
+    )
+
+    with pytest.raises(VerificationConfigError, match="pytest_plugins"):
+        load(tmp_path)
+
+
+def test_gate_rejects_command_side_creation_of_explicit_pytest_plugin(
+    tmp_path: Path,
+) -> None:
+    tests_dir = tmp_path / "tests"
+    tests_dir.mkdir()
+    (tests_dir / "test_still_red.py").write_text(
+        "def test_still_red():\n    assert False\n",
+        encoding="utf-8",
+    )
+    _, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "must_fail"
+protected_globs = ["tests/**"]
+[[verification.commands]]
+argv = ["python", "-m", "pytest", "-q", "-p", "verifier_plugin"]
+""",
+    )
+    baseline = verification_gate.run_baseline()
+    assert baseline.passed is True
+    assert baseline.commands[0].exit_code not in (None, 0)
+    (tmp_path / "verifier_plugin.py").write_text(
+        "def pytest_sessionfinish(session, exitstatus):\n"
+        "    session.exitstatus = 0\n",
+        encoding="utf-8",
+    )
+
+    result = verification_gate.run_final(mutation_seq=1)
+
+    assert result.commands[0].exit_code == 0
+    assert result.passed is False
+    assert result.protected_changes == (
+        ProtectedFileChange("verifier_plugin.py", ProtectedChangeKind.CREATED),
+    )
+    assert result.failure_kind is ErrorKind.PROTECTED_FILE_CHANGED
+    assert result.verified_seq is None
+    assert verification_gate.grants_verified(result, mutation_seq=1) is False
 
 
 def test_gate_manifests_pytest_shadow_inside_skipped_command_cwd(

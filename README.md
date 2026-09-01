@@ -87,12 +87,15 @@ Baseline policies are:
 The config file itself is automatically protected. Configured commands, cwd,
 timeouts, repair limits, and protected globs are validated and frozen before the
 model is created. Configured Python commands also add workspace-controlled
-module shadows and interpreter startup hooks to that frozen boundary. Pytest
-commands additionally add its workspace configuration, `conftest.py`, and
-plugin-discovery metadata candidates. This includes candidates that do not yet
-exist: file tools deny their creation, and the final manifest detects creation
-or change by an allowed process. Missing config or an empty command list is
-valid, but it cannot produce `VERIFIED`.
+`PYTHONPATH` entries and interpreter/site startup controls to that frozen
+boundary; module commands add their filesystem import candidates. Pytest
+commands additionally add workspace configuration, `conftest.py`, explicit and
+discovered plugin targets, and plugin-discovery metadata candidates. Static
+workspace startup/plugin declarations contribute their imported targets;
+unsafe dynamic declarations fail configuration closed. This includes
+candidates that do not yet exist: file tools deny their creation, and the final
+manifest detects creation or change by an allowed process. Missing config or an
+empty command list is valid, but it cannot produce `VERIFIED`.
 
 ## CLI
 
