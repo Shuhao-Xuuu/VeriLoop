@@ -1178,6 +1178,11 @@ def test_completion_interrupt_closes_trace_with_cancelled_terminal(
     ).run("task")
 
     assert result.state is AgentState.CANCELLED
+    assert result.tool_call_count == 1
+    paired = result.history[-1].tool_result
+    assert paired is not None
+    assert paired.call_id == completion.id
+    assert paired.error_kind is ErrorKind.CANCELLED
     events = read_events(writer.events_path)
     assert events[-2]["event_type"] == "run_cancelled"
     assert events[-1]["event_type"] == "run_finished"
@@ -1186,7 +1191,8 @@ def test_completion_interrupt_closes_trace_with_cancelled_terminal(
         for event in events
         if event["event_type"] == "tool_execution_finished"
     )
-    assert finished["payload"]["cancelled"] is True
+    assert finished["payload"]["error_kind"] == ErrorKind.CANCELLED.value
+    assert finished["payload"]["ok"] is False
 
 
 def test_provider_retry_events_are_real_retries_and_do_not_add_model_steps(

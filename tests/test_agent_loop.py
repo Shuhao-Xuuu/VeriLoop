@@ -426,12 +426,54 @@ def test_keyboard_interrupt_during_tool_execution_returns_cancelled() -> None:
     assert result.state is AgentState.CANCELLED
     assert result.error.kind is ErrorKind.CANCELLED
     assert result.step_count == 1
-    assert result.tool_call_count == 0
+    assert result.tool_call_count == 1
     assert [message.role for message in result.history] == [
         Role.SYSTEM,
         Role.USER,
         Role.ASSISTANT,
+        Role.TOOL,
     ]
+    paired = result.history[-1].tool_result
+    assert paired is not None
+    assert paired.call_id == call.id
+    assert paired.error_kind is ErrorKind.CANCELLED
+
+
+def test_tool_cancellation_pairs_later_calls_without_executing_them() -> None:
+    events: list[str] = []
+    registry = make_registry(events)
+
+    def interrupt(arguments: dict[str, object]) -> str:
+        raise KeyboardInterrupt
+
+    registry.register(
+        ToolSpec(
+            name="interrupt",
+            description="Interrupt during test tool execution",
+            input_schema={
+                "type": "object",
+                "properties": {},
+                "additionalProperties": False,
+            },
+            handler=interrupt,
+        )
+    )
+    interrupted = ToolCall(id="interrupt-first", name="interrupt", arguments={})
+    deferred = ToolCall(id="read-deferred", name="read", arguments={"path": "x"})
+    model = ScriptedModel([response("", interrupted, deferred)])
+
+    result = AgentLoop(model, registry).run("cancel tool group")
+
+    assert result.state is AgentState.CANCELLED
+    assert result.tool_call_count == 2
+    assert events == []
+    paired = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+    ]
+    assert [item.call_id for item in paired] == [interrupted.id, deferred.id]
+    assert all(item.error_kind is ErrorKind.CANCELLED for item in paired)
 
 
 def test_each_model_request_gets_tools_and_an_isolated_history_list() -> None:

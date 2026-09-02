@@ -7,10 +7,12 @@ import json
 import os
 from pathlib import Path
 import site
+import time
 
 import pytest
 
 from tests.scripted_model import ScriptedModel
+import veriloop.process as process_module
 from veriloop.agent import AgentLoop
 from veriloop.protocol import (
     AgentResult,
@@ -102,6 +104,33 @@ def verification_stack(workspace: Path, config_text: str):
     registry = ToolRegistry()
     register_workspace_tools(registry, guarded, runner)
     return registry, VerificationGate(spec, runner)
+
+
+def interrupt_first_process_wait_after_start(
+    monkeypatch: pytest.MonkeyPatch,
+    started_marker: Path,
+) -> None:
+    real_popen = process_module.subprocess.Popen
+
+    def popen_then_interrupt(*args, **kwargs):
+        process = real_popen(*args, **kwargs)
+        real_wait = process.wait
+        first_wait = True
+
+        def wait(*, timeout=None):
+            nonlocal first_wait
+            if first_wait:
+                first_wait = False
+                deadline = time.monotonic() + 5
+                while time.monotonic() < deadline and not started_marker.exists():
+                    time.sleep(0.01)
+                raise KeyboardInterrupt
+            return real_wait(timeout=timeout)
+
+        process.wait = wait
+        return process
+
+    monkeypatch.setattr(process_module.subprocess, "Popen", popen_then_interrupt)
 
 
 def test_verification_protocol_exposes_explicit_terminal_states_and_errors() -> None:
@@ -1668,6 +1697,101 @@ def test_timed_out_started_command_advances_mutation_sequence(tmp_path: Path) ->
     ).run("run")
 
     assert result.mutation_seq == 1
+
+
+def test_cancelled_started_command_is_paired_and_advances_mutation_sequence(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_marker = tmp_path / "started.txt"
+    (tmp_path / "slow.py").write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        "Path('started.txt').write_text('started', encoding='utf-8')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    guard = WorkspaceGuard(tmp_path)
+    runner = CommandRunner(guard, CommandPolicy())
+    registry = ToolRegistry()
+    register_workspace_tools(registry, guard, runner)
+    interrupt_first_process_wait_after_start(monkeypatch, started_marker)
+    call = ToolCall(
+        id="cancelled-command",
+        name="run_command",
+        arguments={"argv": ["python", "slow.py"]},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(call)]),
+        registry,
+    ).run("run then cancel")
+
+    assert started_marker.read_text(encoding="utf-8") == "started"
+    assert result.state is AgentState.CANCELLED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.CANCELLED
+    assert result.tool_call_count == 1
+    assert result.mutation_seq == 1
+    paired_results = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+    ]
+    assert len(paired_results) == 1
+    paired = paired_results[0]
+    assert paired.call_id == call.id
+    assert paired.tool_name == call.name
+    assert paired.error_kind is ErrorKind.CANCELLED
+    assert paired.metadata["started"] is True
+    assert paired.invalidates_verification is True
+
+
+def test_cancelled_gate_command_remains_agent_cancellation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    started_marker = tmp_path / "gate-started.txt"
+    (tmp_path / "slow_gate.py").write_text(
+        "from pathlib import Path\n"
+        "import time\n"
+        "Path('gate-started.txt').write_text('started', encoding='utf-8')\n"
+        "time.sleep(30)\n",
+        encoding="utf-8",
+    )
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        """
+[verification]
+baseline_policy = "skip"
+[[verification.commands]]
+argv = ["python", "slow_gate.py"]
+""",
+    )
+    interrupt_first_process_wait_after_start(monkeypatch, started_marker)
+    completion = ToolCall(
+        id="cancelled-gate",
+        name="complete_task",
+        arguments={"summary": "verify"},
+    )
+
+    result = AgentLoop(
+        ScriptedModel([tool_response(completion)]),
+        registry,
+        verification_gate=verification_gate,
+    ).run("verify then cancel")
+
+    assert started_marker.read_text(encoding="utf-8") == "started"
+    assert result.state is AgentState.CANCELLED
+    assert result.error is not None
+    assert result.error.kind is ErrorKind.CANCELLED
+    assert result.tool_call_count == 1
+    assert result.mutation_seq == 0
+    assert result.final_verification is None
+    paired = result.history[-1].tool_result
+    assert paired is not None
+    assert paired.call_id == completion.id
+    assert paired.error_kind is ErrorKind.CANCELLED
 
 
 def test_command_start_error_does_not_advance_mutation_sequence(

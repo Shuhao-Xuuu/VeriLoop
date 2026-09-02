@@ -132,7 +132,7 @@ mutating specs set it automatically; expected errors set it only when an
 operation actually started.
 
     successful edit/create/overwrite
-    or started model run_command (zero/nonzero/timeout)
+    or started model run_command (zero/nonzero/timeout/cancelled)
       -> invalidates_verification=true
       -> mutation_seq += 1
       -> verified_seq=None

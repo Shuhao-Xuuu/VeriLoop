@@ -516,6 +516,17 @@ class AgentLoop:
                             executed=request_executed,
                         ),
                     )
+                    if request_result.error_kind is ErrorKind.CANCELLED:
+                        transition(AgentState.CANCELLED)
+                        return finish(
+                            "",
+                            error=AgentError(
+                                kind=ErrorKind.CANCELLED,
+                                message=(
+                                    "agent run cancelled during completion request"
+                                ),
+                            ),
+                        )
                     continue
 
                 summary = str(call.arguments["summary"])
@@ -745,7 +756,7 @@ class AgentLoop:
                 )
 
             transition(AgentState.EXECUTING)
-            for call in response.tool_calls:
+            for call_index, call in enumerate(response.tool_calls):
                 trace("tool_execution_started", tool_call_payload(call))
                 try:
                     result, executed = execute_tool(call)
@@ -789,6 +800,30 @@ class AgentLoop:
                         },
                     )
                 history.append(_tool_message(result))
+                if result.error_kind is ErrorKind.CANCELLED:
+                    for deferred_call in response.tool_calls[call_index + 1 :]:
+                        deferred_result = make_tool_failure(
+                            deferred_call,
+                            ErrorKind.CANCELLED,
+                            (
+                                "tool call was not executed because an earlier "
+                                "tool call was cancelled"
+                            ),
+                        )
+                        tool_call_count += 1
+                        history.append(_tool_message(deferred_result))
+                        trace(
+                            "tool_execution_finished",
+                            tool_result_payload(deferred_result, executed=False),
+                        )
+                    transition(AgentState.CANCELLED)
+                    return finish(
+                        "",
+                        error=AgentError(
+                            kind=ErrorKind.CANCELLED,
+                            message="agent run cancelled during tool execution",
+                        ),
+                    )
 
 
 def _redact_known_secrets(value: str, known_secrets: Sequence[str]) -> str:

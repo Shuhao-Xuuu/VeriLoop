@@ -38,6 +38,21 @@ class ToolExecutionError(RuntimeError):
         self.invalidates_verification = invalidates_verification
 
 
+class ToolCancelledError(KeyboardInterrupt):
+    """A cancellation that preserves tool evidence for registry execution."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        metadata: dict[str, Any] | None = None,
+        invalidates_verification: bool = False,
+    ) -> None:
+        super().__init__(message)
+        self.metadata = dict(metadata or {})
+        self.invalidates_verification = invalidates_verification
+
+
 @dataclass(frozen=True, slots=True)
 class ToolSpec:
     name: str
@@ -103,6 +118,23 @@ class ToolRegistry:
                 invalidates_verification=(
                     spec.mutates_workspace and exc.invalidates_verification
                 ),
+            )
+        except ToolCancelledError as exc:
+            return _tool_failure(
+                call,
+                ErrorKind.CANCELLED,
+                str(exc),
+                metadata=exc.metadata,
+                invalidates_verification=(
+                    spec.mutates_workspace and exc.invalidates_verification
+                ),
+            )
+        except KeyboardInterrupt:
+            return _tool_failure(
+                call,
+                ErrorKind.CANCELLED,
+                "tool execution was cancelled",
+                invalidates_verification=spec.mutates_workspace,
             )
         except Exception as exc:
             return _tool_failure(

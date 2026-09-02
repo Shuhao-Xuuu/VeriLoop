@@ -123,6 +123,11 @@ injects `call_id` and `tool_name` and serializes deterministic JSON content. The
 provider receives that content on the next tool message; error kinds are not
 hidden only in an internal field.
 
+Post-launch command cancellation uses `ToolCancelledError`, which remains a
+`KeyboardInterrupt` when the Gate calls `CommandRunner` directly. When a model
+tool invokes the same runner, `ToolRegistry` converts cancellation to a paired
+result so the loop can record start/mutation evidence before ending `CANCELLED`.
+
 ## WorkspaceGuard call path
 
 `WorkspaceGuard.__init__` requires an existing directory and stores
@@ -438,7 +443,7 @@ when a process really started. The loop advances `mutation_seq` and clears
 - successful `edit_file`;
 - successful `write_file` create or overwrite;
 - a model-requested `run_command` that started, whether it exits zero, exits
-  nonzero, or times out.
+  nonzero, times out, or is cancelled while running.
 
 Reads, searches, listings, unknown tools, invalid arguments, denied commands,
 process start errors, failed file changes, `complete_task`, and Gate-owned
@@ -586,7 +591,7 @@ release work.
 | Frozen valid, missing, changed-on-disk, invalid, unsafe, and secret-bearing configuration | opening configuration tests in `tests/test_verification.py` |
 | `must_fail`, `record_only`, `skip`, timeout/start errors, and frozen command order | `test_baseline_*` in `tests/test_verification.py` |
 | Modified/deleted/created/replaced protected paths, automatic config protection, and file-tool write denial | protected-manifest and protected-tool tests in `tests/test_verification.py` |
-| Read-only tools, successful/failed file changes, started/non-started commands, timeout, and proactive pytest freshness | mutation-sequence tests in `tests/test_verification.py` |
+| Read-only tools, successful/failed file changes, started/non-started/cancelled commands, timeout, and proactive pytest freshness | mutation-sequence tests in `tests/test_verification.py` |
 | Final Gate success, command failure, timeout, start error, protected changes, and frozen commands | `test_final_gate_*` in `tests/test_verification.py` |
 | Completion without commands, green completion, forged arguments, plain final, and mixed calls | `test_complete_task_*`, `test_mixed_complete_task_*`, and `test_plain_final_*` in `tests/test_verification.py` |
 | Repair evidence visibility, exact attempt budget, recovery plain final, repeated signatures, and counter reset | repair and failure-signature tests in `tests/test_verification.py` |

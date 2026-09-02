@@ -16,7 +16,7 @@ from typing import BinaryIO, Iterable, Mapping
 
 from .filesystem import WorkspaceGuard
 from .protocol import ErrorKind
-from .tools import ToolExecutionError
+from .tools import ToolCancelledError, ToolExecutionError
 
 
 DEFAULT_TIMEOUT_SECONDS = 60
@@ -359,6 +359,21 @@ class CommandRunner:
             except subprocess.TimeoutExpired:
                 timed_out = True
                 _terminate_process(process, self.termination_grace_seconds)
+            except KeyboardInterrupt as exc:
+                _terminate_process(process, self.termination_grace_seconds)
+                result = self._result(
+                    command,
+                    cwd_path,
+                    process,
+                    stdout_file,
+                    stderr_file,
+                    started,
+                )
+                raise ToolCancelledError(
+                    "command was cancelled after it started",
+                    metadata=result,
+                    invalidates_verification=True,
+                ) from exc
             except BaseException:
                 _terminate_process(process, self.termination_grace_seconds)
                 raise
