@@ -42,6 +42,8 @@ from .tools import ToolExecutionError, contains_known_secret
 DEFAULT_CONFIG_PATH = ".veriloop.toml"
 DEFAULT_MAX_REPAIR_ROUNDS = 2
 DEFAULT_MAX_SAME_FAILURE = 2
+_FAILURE_SIGNATURE_SAMPLE_CHARS = 2048
+_FAILURE_SIGNATURE_EDGE_CHARS = _FAILURE_SIGNATURE_SAMPLE_CHARS // 2
 
 _PYTHON_STARTUP_CONTROL_MODULES = (
     "sitecustomize",
@@ -469,11 +471,11 @@ def _failure_signature(
                     if command.error_kind is not None
                     else None
                 ),
-                "stdout_tail": _normalized_failure_tail(
+                "stdout_sample": _normalized_failure_sample(
                     command.stdout,
                     workspace_root,
                 ),
-                "stderr_tail": _normalized_failure_tail(
+                "stderr_sample": _normalized_failure_sample(
                     command.stderr,
                     workspace_root,
                 ),
@@ -497,8 +499,22 @@ def _failure_signature(
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _normalized_failure_tail(text: str, workspace_root: Path) -> str:
-    return _normalized_failure_text(text, workspace_root)[-2048:]
+def _normalized_failure_sample(
+    text: str,
+    workspace_root: Path,
+) -> dict[str, str | bool]:
+    normalized = _normalized_failure_text(text, workspace_root)
+    if len(normalized) <= _FAILURE_SIGNATURE_SAMPLE_CHARS:
+        return {
+            "head": normalized,
+            "tail": "",
+            "middle_omitted": False,
+        }
+    return {
+        "head": normalized[:_FAILURE_SIGNATURE_EDGE_CHARS],
+        "tail": normalized[-_FAILURE_SIGNATURE_EDGE_CHARS:],
+        "middle_omitted": True,
+    }
 
 
 def _normalized_failure_text(text: str, workspace_root: Path) -> str:

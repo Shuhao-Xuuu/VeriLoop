@@ -474,11 +474,11 @@ remains. A materially different signature resets the consecutive count; a
 missing signature cannot accidentally trigger stalling.
 
 `_failure_signature` hashes deterministic JSON containing failure kind, command
-argv/cwd, start/timeout/exit/error facts, normalized stdout/stderr tails, and
-sorted path-only protected changes. It excludes duration and normalizes
-workspace/temp paths, timestamps, process IDs, run IDs, elapsed values, and
-random temporary path components. This makes repeated substantive failures
-stable without storing full output.
+argv/cwd, start/timeout/exit/error facts, bounded normalized stdout/stderr
+head/tail samples, and sorted path-only protected changes. It excludes duration
+and normalizes workspace/temp paths, timestamps, process IDs, run IDs, elapsed
+values, and random temporary path components. This makes repeated substantive
+failures stable without storing full output.
 
 If the model emits plain final text while recovering, it still ends
 `COMPLETED_UNVERIFIED`; the last failed verification remains in the result as

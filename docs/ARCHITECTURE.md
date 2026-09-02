@@ -172,9 +172,9 @@ consumes one round; max_repair_rounds=N permits the initial attempt plus N
 repaired attempts.
 
 The signature hashes deterministic failure kind, normalized argv/cwd/start/
-timeout/exit/error data, bounded output tails, and sorted protected changes.
-Workspace/temp roots, timestamps, elapsed values, volatile IDs, and random
-temporary paths are normalized; duration is excluded. Equal consecutive
+timeout/exit/error data, bounded output head/tail samples, and sorted protected
+changes. Workspace/temp roots, timestamps, elapsed values, volatile IDs, and
+random temporary paths are normalized; duration is excluded. Equal consecutive
 signatures increment the counter. New/missing signatures reset it. Reaching
 max_same_failure stops before another model call.
 

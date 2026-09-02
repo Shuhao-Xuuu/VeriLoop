@@ -2674,13 +2674,17 @@ argv = ["python", "verify.py"]
     assert third.failure_signature != fourth.failure_signature
 
 
-def test_failure_signature_uses_tail_not_output_truncation_state(
+def test_failure_signature_keeps_distinct_heads_with_shared_long_tail(
     tmp_path: Path,
 ) -> None:
     verify = tmp_path / "verify.py"
-    stable_tail = "z" * 3000
+    stable_tail = "shared footer\n" + ("z" * 3000)
     verify.write_text(
-        f"print('short-prefix' + {stable_tail!r})\nraise SystemExit(1)\n",
+        (
+            "print('AssertionError: expected 1')\n"
+            f"print({stable_tail!r})\n"
+            "raise SystemExit(1)\n"
+        ),
         encoding="utf-8",
     )
     _, verification_gate = verification_stack(
@@ -2695,14 +2699,20 @@ argv = ["python", "verify.py"]
 
     first = verification_gate.run_final(mutation_seq=0)
     verify.write_text(
-        f"print({'x' * 70000!r} + {stable_tail!r})\nraise SystemExit(1)\n",
+        (
+            "print('AssertionError: expected 2')\n"
+            f"print({stable_tail!r})\n"
+            "raise SystemExit(1)\n"
+        ),
         encoding="utf-8",
     )
     second = verification_gate.run_final(mutation_seq=1)
 
     assert first.commands[0].stdout_truncated is False
-    assert second.commands[0].stdout_truncated is True
-    assert first.failure_signature == second.failure_signature
+    assert second.commands[0].stdout_truncated is False
+    assert first.failure_signature is not None
+    assert second.failure_signature is not None
+    assert first.failure_signature != second.failure_signature
 
 
 def test_missing_failure_signature_does_not_trigger_stalled(
@@ -2923,15 +2933,24 @@ argv = ["python", "verify.py"]
 
 
 def test_different_consecutive_failure_resets_stall_counter(tmp_path: Path) -> None:
-    verify = tmp_path / "verify.py"
-    original = b"print('one')\nraise SystemExit(1)\n"
-    verify.write_bytes(original)
+    stable_tail = "shared footer\n" + ("z" * 3000)
+    (tmp_path / "verify.py").write_text(
+        "from pathlib import Path\n"
+        "diagnostic = Path('diagnostic.txt').read_text(encoding='utf-8').strip()\n"
+        "print('AssertionError: expected ' + diagnostic)\n"
+        f"print({stable_tail!r})\n"
+        "raise SystemExit(1)\n",
+        encoding="utf-8",
+    )
+    diagnostic = tmp_path / "diagnostic.txt"
+    original = b"one\n"
+    diagnostic.write_bytes(original)
     registry, verification_gate = verification_stack(
         tmp_path,
         """
 [verification]
 baseline_policy = "skip"
-max_repair_rounds = 1
+max_repair_rounds = 2
 max_same_failure = 2
 [[verification.commands]]
 argv = ["python", "verify.py"]
@@ -2946,9 +2965,9 @@ argv = ["python", "verify.py"]
         id="different-edit",
         name="edit_file",
         arguments={
-            "path": "verify.py",
-            "old_text": "print('one')\nraise SystemExit(1)",
-            "new_text": "print('two')\nraise SystemExit(2)",
+            "path": "diagnostic.txt",
+            "old_text": "one",
+            "new_text": "two",
             "expected_sha256": hashlib.sha256(original).hexdigest(),
         },
     )
@@ -2958,7 +2977,12 @@ argv = ["python", "verify.py"]
         arguments={"summary": "second"},
     )
     model = ScriptedModel(
-        [tool_response(first), tool_response(edit), tool_response(second)]
+        [
+            tool_response(first),
+            tool_response(edit),
+            tool_response(second),
+            final_response("repair opportunity preserved"),
+        ]
     )
 
     result = AgentLoop(
@@ -2967,11 +2991,23 @@ argv = ["python", "verify.py"]
         verification_gate=verification_gate,
     ).run("task")
 
-    assert result.state is AgentState.VERIFICATION_FAILED
-    assert result.error is not None
-    assert result.error.kind is ErrorKind.VERIFICATION_FAILED
-    assert result.repair_rounds_used == 1
+    assert result.state is AgentState.COMPLETED_UNVERIFIED
+    assert result.error is None
+    assert result.final_message == "repair opportunity preserved"
+    assert result.repair_rounds_used == 2
+    assert result.mutation_seq == 1
+    assert model.call_count == 4
     assert result.final_verification is not None
-    final_result = result.history[-1].tool_result
-    assert final_result is not None
-    assert json.loads(final_result.content)["same_failure_count"] == 1
+    completion_results = {
+        message.tool_result.call_id: message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+        and message.tool_result.tool_name == "complete_task"
+    }
+    first_result = completion_results[first.id]
+    second_result = completion_results[second.id]
+    first_payload = json.loads(first_result.content)
+    second_payload = json.loads(second_result.content)
+    assert first_payload["failure_signature"] != second_payload["failure_signature"]
+    assert second_result.retryable is True
+    assert second_payload["same_failure_count"] == 1
