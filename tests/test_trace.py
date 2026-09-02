@@ -1485,6 +1485,58 @@ argv = ["python", "verify.py"]
     assert artifact["changed_files"] == ["value.txt"]
 
 
+def test_step_exhaustion_does_not_persist_an_unoffered_repair_round(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "verify.py").write_text("raise SystemExit(1)\n", encoding="utf-8")
+    (tmp_path / ".veriloop.toml").write_text(
+        """
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = 2
+max_same_failure = 3
+[[verification.commands]]
+argv = ["python", "verify.py"]
+""",
+        encoding="utf-8",
+    )
+    registry, gate = production_verification_stack(tmp_path)
+    completion = ToolCall(
+        id="step-limited",
+        name="complete_task",
+        arguments={"summary": "not fixed"},
+    )
+    model = ScriptedModel([response("", completion)])
+    writer = TraceWriter(tmp_path, run_id="step-limited-repair")
+
+    result = AgentLoop(
+        model,
+        registry,
+        max_steps=1,
+        verification_gate=gate,
+        trace_writer=writer,
+    ).run("task")
+
+    assert result.state is AgentState.MAX_STEPS
+    assert result.repair_rounds_used == 0
+    assert model.call_count == 1
+    events = read_events(writer.events_path)
+    assert not any(event["event_type"] == "recovery_started" for event in events)
+    completion_result = next(
+        event["payload"]
+        for event in events
+        if event["event_type"] == "tool_execution_finished"
+        and event["payload"]["tool_name"] == "complete_task"
+    )
+    assert completion_result["retryable"] is False
+    assert completion_result["error_kind"] == ErrorKind.MAX_STEPS.value
+    assert completion_result["metadata"]["remaining_repair_rounds"] == 2
+    assert events[-1]["payload"]["repair_rounds_used"] == 0
+    artifact = json.loads(writer.result_path.read_text(encoding="utf-8"))
+    assert artifact["state"] == AgentState.MAX_STEPS.value
+    assert artifact["repair_rounds_used"] == 0
+
+
 def test_trace_metadata_is_excluded_from_wildcard_protection(tmp_path: Path) -> None:
     (tmp_path / "verify.py").write_text("raise SystemExit(0)\n", encoding="utf-8")
     (tmp_path / ".veriloop.toml").write_text(

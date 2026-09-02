@@ -464,6 +464,10 @@ verification attempts. Once the budget is exhausted, the last evidence is
 paired into history, state becomes `VERIFICATION_FAILED`, and no extra model
 request occurs.
 
+If repair budget remains but `max_steps` prevents another model request, the
+last verification result is paired as non-retryable, unused repair rounds stay
+unused, and the run ends `MAX_STEPS` without entering `RECOVERING`.
+
 Before spending another repair round, the loop counts consecutive equal failure
 signatures. Reaching `max_same_failure` ends `STALLED`, even if repair budget
 remains. A materially different signature resets the consecutive count; a

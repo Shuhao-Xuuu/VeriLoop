@@ -2459,6 +2459,97 @@ argv = ["python", "always_fail.py"]
     ] == 0
 
 
+@pytest.mark.parametrize(
+    (
+        "max_steps",
+        "max_repair_rounds",
+        "expected_state",
+        "expected_rounds_used",
+        "expected_remaining",
+        "expected_retryable",
+    ),
+    [
+        (1, 0, AgentState.VERIFICATION_FAILED, 0, 0, [False]),
+        (1, 1, AgentState.MAX_STEPS, 0, 1, [False]),
+        (1, 2, AgentState.MAX_STEPS, 0, 2, [False]),
+        (2, 2, AgentState.MAX_STEPS, 1, 1, [True, False]),
+    ],
+)
+def test_model_step_budget_only_counts_repair_rounds_that_reach_the_model(
+    tmp_path: Path,
+    max_steps: int,
+    max_repair_rounds: int,
+    expected_state: AgentState,
+    expected_rounds_used: int,
+    expected_remaining: int,
+    expected_retryable: list[bool],
+) -> None:
+    (tmp_path / "always_fail.py").write_text(
+        """
+from pathlib import Path
+path = Path("attempts.txt")
+count = int(path.read_text()) if path.exists() else 0
+path.write_text(str(count + 1))
+raise SystemExit(3)
+""",
+        encoding="utf-8",
+    )
+    registry, verification_gate = verification_stack(
+        tmp_path,
+        f"""
+[verification]
+baseline_policy = "skip"
+max_repair_rounds = {max_repair_rounds}
+max_same_failure = 99
+[[verification.commands]]
+argv = ["python", "always_fail.py"]
+""",
+    )
+    model = ScriptedModel(
+        [
+            tool_response(
+                ToolCall(
+                    id=f"step-limited-{index}",
+                    name="complete_task",
+                    arguments={"summary": f"attempt {index}"},
+                )
+            )
+            for index in range(max_steps)
+        ]
+    )
+
+    result = AgentLoop(
+        model,
+        registry,
+        max_steps=max_steps,
+        verification_gate=verification_gate,
+    ).run("task")
+
+    assert result.state is expected_state
+    assert result.error is not None
+    assert result.error.kind is (
+        ErrorKind.MAX_STEPS
+        if expected_state is AgentState.MAX_STEPS
+        else ErrorKind.VERIFICATION_FAILED
+    )
+    assert result.repair_rounds_used == expected_rounds_used
+    assert model.call_count == max_steps
+    assert int((tmp_path / "attempts.txt").read_text(encoding="utf-8")) == max_steps
+    completion_results = [
+        message.tool_result
+        for message in result.history
+        if message.tool_result is not None
+        and message.tool_result.tool_name == "complete_task"
+    ]
+    assert [item.retryable for item in completion_results] == expected_retryable
+    final_result = completion_results[-1]
+    assert final_result.error_kind is result.error.kind
+    final_payload = json.loads(final_result.content)
+    assert final_payload["state"] == expected_state.value
+    assert final_payload["remaining_repair_rounds"] == expected_remaining
+    assert result.state_history.count(AgentState.RECOVERING) == expected_rounds_used
+
+
 def test_plain_final_during_recovery_stays_unverified_and_preserves_failure(
     tmp_path: Path,
 ) -> None:

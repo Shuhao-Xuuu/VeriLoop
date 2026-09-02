@@ -163,7 +163,8 @@ accepted from the provider as verification authority.
       -> pass -> paired success result -> VERIFIED
       -> failure -> paired evidence result
            -> same-signature threshold -> STALLED
-           -> budget remains -> RECOVERING -> THINKING
+           -> repair + model-step budgets remain -> RECOVERING -> THINKING
+           -> repair remains but model-step budget ends -> MAX_STEPS
            -> exhausted -> VERIFICATION_FAILED
 
 The failure result enters canonical history before recovery. Entering recovery

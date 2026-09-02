@@ -704,6 +704,39 @@ class AgentLoop:
                     )
 
                 max_repair_rounds = self._verification_gate.spec.max_repair_rounds
+                if (
+                    repair_rounds_used < max_repair_rounds
+                    and step_count >= self._max_steps
+                ):
+                    remaining_repair_rounds = (
+                        max_repair_rounds - repair_rounds_used
+                    )
+                    completion_result = _verification_tool_result(
+                        call,
+                        final_verification,
+                        verified=False,
+                        retryable=False,
+                        remaining_repair_rounds=remaining_repair_rounds,
+                        terminal_state=AgentState.MAX_STEPS,
+                        error_kind_override=ErrorKind.MAX_STEPS,
+                        same_failure_count=same_failure_count,
+                    )
+                    history.append(_tool_message(completion_result))
+                    trace(
+                        "tool_execution_finished",
+                        tool_result_payload(completion_result),
+                    )
+                    transition(AgentState.MAX_STEPS)
+                    return finish(
+                        "",
+                        error=AgentError(
+                            kind=ErrorKind.MAX_STEPS,
+                            message=(
+                                "maximum model steps reached: "
+                                f"{self._max_steps}"
+                            ),
+                        ),
+                    )
                 if repair_rounds_used < max_repair_rounds:
                     remaining_repair_rounds = (
                         max_repair_rounds - repair_rounds_used
